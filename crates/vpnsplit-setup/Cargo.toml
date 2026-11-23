@@ -1,0 +1,22 @@
+[package]
+name = "vpnsplit-setup"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+
+# Установщик — один файл, в который вшито всё, что ставится. Зависимостей
+# у него намеренно нет, кроме привязок к Windows: он должен работать на
+# машине, где ещё ничего нашего нет.
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Registry",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]

@@ -1,0 +1,23 @@
+[package]
+name = "vpnsplit-hook"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "vpnsplit_hook"
+crate-type = ["cdylib"]
+
+[dependencies]
+vpnsplit-core = { workspace = true }
+vpnsplit-inject = { workspace = true }
+minhook = "0.9"
+
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+]

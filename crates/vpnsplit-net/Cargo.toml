@@ -1,0 +1,36 @@
+[package]
+name = "vpnsplit-net"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+vpnsplit-core = { workspace = true }
+serde = "1"
+serde_json = "1"
+
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_WindowsFilteringPlatform",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_Packaging_Appx",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
+    "Win32_System_Pipes",
+    # FwpmEngineOpen0 принимает SEC_WINNT_AUTH_IDENTITY_W и потому спрятан
+    # за фичей RPC, хотя сам к RPC отношения не имеет.
+    "Win32_System_Rpc",
+    "Win32_System_Threading",
+    # EVENT_TRACE_LOGFILEW и OpenTraceW спрятаны за этой фичей: в структуре
+    # лежит заголовок журнала со временем.
+    "Win32_System_Time",
+]

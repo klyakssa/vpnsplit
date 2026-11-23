@@ -1,0 +1,14 @@
+[package]
+name = "vpnsplit-probe"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+vpnsplit-core = { workspace = true }
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+]

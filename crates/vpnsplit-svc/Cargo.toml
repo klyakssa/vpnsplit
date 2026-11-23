@@ -1,0 +1,32 @@
+[package]
+name = "vpnsplit-svc"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+vpnsplit-core = { workspace = true }
+vpnsplit-net = { workspace = true }
+serde_json = "1"
+windows-service = "0.8"
+
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinHttp",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    # Пароль ключа с клавиатуры — без показа на экране.
+    "Win32_System_Console",
+    # Своё подключение: OpenVPN запускается в задании «умереть вместе со
+    # службой» и останавливается по именованному событию.
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+]

@@ -1,0 +1,22 @@
+[package]
+name = "vpnsplit-launch"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+vpnsplit-core = { workspace = true }
+vpnsplit-inject = { workspace = true }
+vpnsplit-net = { workspace = true }
+
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+]

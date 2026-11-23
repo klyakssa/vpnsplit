@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vpnsplit-core",
+    "crates/vpnsplit-svc",
+    "crates/vpnsplit-ui",
+    "crates/vpnsplit-hook",
+    "crates/vpnsplit-probe",
+    "crates/vpnsplit-launch",
+    "crates/vpnsplit-inject",
+    "crates/vpnsplit-net",
+    "crates/vpnsplit-setup",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+
+[workspace.dependencies]
+vpnsplit-core = { path = "crates/vpnsplit-core" }
+vpnsplit-inject = { path = "crates/vpnsplit-inject" }
+vpnsplit-net = { path = "crates/vpnsplit-net" }
+
+# panic = "abort" здесь намеренно НЕ ставится: vpnsplit-hook грузится в чужие
+# процессы, и паника не должна ронять приложение пользователя.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

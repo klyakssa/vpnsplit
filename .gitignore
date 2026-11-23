@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+*.pdb
+/config/*.conf
+/vendor/*.zip
+/dist
+/docs/
+/vendor/wireguard-nt/
+*.pem
+/config/*.ovpn
