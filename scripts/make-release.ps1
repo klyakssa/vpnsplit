@@ -15,6 +15,20 @@ Set-Location $root
 $key = Join-Path $env:USERPROFILE '.vpnsplit\release-key.pem'
 if (-not (Test-Path $key)) { throw "no release key: $key - create it once with scripts\new-release-key.ps1" }
 
+# openssl comes with Git for Windows, but is not always on the PATH.
+$openssl = (Get-Command openssl -ErrorAction SilentlyContinue).Source
+if (-not $openssl) {
+    foreach ($place in "$env:ProgramFiles\Git\mingw64\bin\openssl.exe", "$env:ProgramFiles\Git\usr\bin\openssl.exe") {
+        if (Test-Path $place) { $openssl = $place; break }
+    }
+}
+if (-not $openssl) { throw 'openssl is not found (it comes with Git for Windows) - nothing was built' }
+
+# A description without its signature (or with an old one) must never be left
+# lying around: uploaded, it would make every installed copy refuse the release.
+$dist = Join-Path $root 'dist'
+Remove-Item (Join-Path $dist 'vpnsplit-setup.manifest'), (Join-Path $dist 'vpnsplit-setup.manifest.sig') -ErrorAction SilentlyContinue
+
 # The build number is the time of the build; a later release is a greater number.
 $build = Get-Date -Format 'yyyyMMddHHmm'
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'make-setup.ps1') -build $build
@@ -30,12 +44,18 @@ $size = (Get-Item $setup).Length
 $text = "vpnsplit-update 1`nbuild=$build`nversion=$version`nsize=$size`nsha256=$hash`n"
 [IO.File]::WriteAllText($manifest, $text, (New-Object Text.UTF8Encoding $false))
 
-& openssl dgst -sha256 -sign $key -out $signature $manifest
-if ($LASTEXITCODE -ne 0) { throw 'openssl did not sign the description' }
+& $openssl dgst -sha256 -sign $key -out $signature $manifest
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $signature)) {
+    Remove-Item $manifest, $signature -ErrorAction SilentlyContinue
+    throw 'openssl did not sign the description - nothing to publish'
+}
 
 # The same check the installed service will make, by the same code.
 & (Join-Path $root 'target\release\vpnsplit-svc.exe') update verify $manifest $signature
-if ($LASTEXITCODE -ne 0) { throw 'the service does NOT accept this signature - do not publish' }
+if ($LASTEXITCODE -ne 0) {
+    Remove-Item $manifest, $signature -ErrorAction SilentlyContinue
+    throw 'the service does NOT accept this signature - nothing to publish'
+}
 
 Write-Host ''
 Write-Host "release $version, build $build - upload these three files to a new GitHub release:"
