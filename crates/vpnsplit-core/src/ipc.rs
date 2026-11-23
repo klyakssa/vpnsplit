@@ -54,6 +54,10 @@ pub enum Request {
     VpnAction { name: String, action: VpnAction },
     /// Сменить логин и пароль подключения, не трогая его конфиг.
     SetVpnLogin { name: String, login: Login },
+    /// Проверить обновление сейчас, не дожидаясь срока. Что ставить и
+    /// ставить ли, служба решает сама, как и по сроку, — поэтому просить
+    /// может любой.
+    CheckUpdate,
     /// Проверка kill-switch: закрыть приложению сеть на несколько секунд,
     /// не дожидаясь падения туннеля. Защита, которую нельзя проверить, —
     /// это обещание, а не защита.
@@ -128,7 +132,8 @@ impl Request {
             | Request::ClearVpnConfig { .. }
             | Request::ConnectVpn { .. }
             | Request::VpnAction { .. }
-            | Request::SetVpnLogin { .. } => false,
+            | Request::SetVpnLogin { .. }
+            | Request::CheckUpdate => false,
             Request::CheckKillswitch(_)
             | Request::ProbeDivert { .. }
             | Request::ProbeFlows { .. }

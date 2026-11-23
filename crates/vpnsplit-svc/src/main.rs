@@ -40,8 +40,19 @@ fn main() -> ExitCode {
         "addb" => edit_policy(args.get(1), true, true),
         "remove" => edit_policy(args.get(1), false, false),
         "vpn" => own_vpn(args.get(1), args.get(2), args.get(3)),
-        "update" => store::Store::for_console()
-            .and_then(|store| update::command(&store, args.get(1), args.get(2), args.get(3))),
+        // Проверить сейчас может только служба: ставит обновление она.
+        "update" if args.get(1).map(String::as_str) == Some("now") => {
+            match ask(&Request::CheckUpdate) {
+                Ok(Response::Ok) => {
+                    println!("служба проверяет GitHub; что вышло — в её журнале, строки «обновления:»");
+                    Ok(())
+                }
+                Ok(Response::Error(e)) => Err(e),
+                Ok(other) => Err(format!("неожиданный ответ: {other:?}")),
+                Err(e) => Err(e),
+            }
+        }
+        "update" => update::command(args.get(1), args.get(2), args.get(3)),
         "killswitch" => check_killswitch(args.get(1)),
         "notunnel" => check_no_tunnel(args.get(1)),
         "divert" => probe_divert(args.get(1)),
@@ -105,7 +116,8 @@ fn print_help() {
     println!("  vpn check ФАЙЛ   ничего не меняя: что из конфига дойдёт до OpenVPN, примет ли он");
     println!("                   его и подходит ли пароль ключа (сервер при этом не тревожится)");
     println!("  vpn              что со своими подключениями сейчас");
-    println!("  update           что с обновлениями; update look — что сейчас лежит на GitHub;");
+    println!("  update           что с обновлениями; update now — проверить и поставить сейчас;");
+    println!("                   update look — что сейчас лежит на GitHub;");
     println!("                   update verify ОПИСАНИЕ ПОДПИСЬ — проверить подпись выпуска");
     println!("  killswitch ПУТЬ  проверка: закрыть приложению сеть на 12 секунд");
     println!("  notunnel [СЕК]   проверка: путь B делает вид, что туннеля нет");

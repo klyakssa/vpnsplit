@@ -293,8 +293,40 @@ fn installed() -> Option<PathBuf> {
     exe.with_file_name(SETUP).is_file().then(|| exe.parent().map(Path::to_owned)).flatten()
 }
 
+/// Просьба проверить сейчас, не дожидаясь срока, — и работает ли вообще
+/// поток, которому она адресована.
+static ASKED: (std::sync::Mutex<bool>, std::sync::Condvar) =
+    (std::sync::Mutex::new(false), std::sync::Condvar::new());
+static ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Проверить обновление сейчас. Ложь — искать некому: сборка для
+/// разработки или копия не установлена.
+pub fn check_now() -> bool {
+    if !ACTIVE.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    *ASKED.0.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    ASKED.1.notify_all();
+    true
+}
+
+/// Спит до срока или до просьбы. Правда — разбудила просьба.
+fn nap(patience: Duration) -> bool {
+    let guard = ASKED.0.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut asked, _) = ASKED
+        .1
+        .wait_timeout_while(guard, patience, |asked| !*asked)
+        .unwrap_or_else(|e| e.into_inner());
+    std::mem::take(&mut *asked)
+}
+
+/// Каталог данных службы. Консоли он нужен только чтобы увидеть файл-отказ.
+fn data_dir() -> PathBuf {
+    PathBuf::from(std::env::var_os("ProgramData").unwrap_or_default()).join("vpnsplit")
+}
+
 /// Что служба думает об обновлениях — одной строкой.
-pub fn describe(store: &Store) -> String {
+pub fn describe(data: &Path) -> String {
     if BUILD == 0 {
         return "сборка без номера (для разработки) — обновления не ищутся".to_owned();
     }
@@ -302,7 +334,7 @@ pub fn describe(store: &Store) -> String {
         "ключ выпусков в программу не вшит — обновления не ищутся"
     } else if installed().is_none() {
         "копия не установлена установщиком — обновления не ищутся"
-    } else if store.dir().join(OPT_OUT).is_file() {
+    } else if data.join(OPT_OUT).is_file() {
         "обновления выключены файлом no-update"
     } else {
         "обновления ищутся сами, раз в шесть часов"
@@ -312,30 +344,44 @@ pub fn describe(store: &Store) -> String {
 
 /// Запускает поиск обновлений в своём потоке.
 pub fn start(store: Store) {
-    store.log(&format!("обновления: {}", describe(&store)));
+    store.log(&format!("обновления: {}", describe(store.dir())));
     let Some(dir) = installed() else { return };
     if BUILD == 0 || MODULUS.is_empty() {
         return;
     }
     // Что осталось от прошлого обновления — своё оно отслужило.
     let _ = std::fs::remove_dir_all(dir.join("update"));
+    ACTIVE.store(true, std::sync::atomic::Ordering::Release);
     let spawned = std::thread::Builder::new().name("update".into()).spawn(move || {
-        std::thread::sleep(FIRST_CHECK);
-        // Одно и то же «не вышло» раз в шесть часов журналу ни к чему.
+        let mut asked = nap(FIRST_CHECK);
+        // Одно и то же «не вышло» раз в шесть часов журналу ни к чему — а
+        // тому, кто попросил проверить, ответ нужен всегда.
         let mut last_trouble = String::new();
         loop {
-            if !store.dir().join(OPT_OUT).is_file() {
+            if asked {
+                store.log("обновления: проверка по просьбе");
+            }
+            if store.dir().join(OPT_OUT).is_file() {
+                if asked {
+                    store.log("обновления: выключены файлом no-update — не ищу");
+                }
+            } else {
                 match check(&store, &dir) {
-                    Ok(()) => last_trouble.clear(),
+                    Ok(found) => {
+                        last_trouble.clear();
+                        if asked && !found {
+                            store.log("обновления: выпуска новее нашей сборки на GitHub нет");
+                        }
+                    }
                     Err(reason) => {
-                        if reason != last_trouble {
+                        if asked || reason != last_trouble {
                             store.log(&format!("обновления: {reason}"));
                             last_trouble = reason;
                         }
                     }
                 }
             }
-            std::thread::sleep(PERIOD);
+            asked = nap(PERIOD);
         }
     });
     if let Err(e) = spawned {
@@ -349,8 +395,9 @@ fn newer(build: u64) -> bool {
     build > BUILD
 }
 
-/// Одна проверка: есть ли выпуск новее, и если есть — поставить.
-fn check(store: &Store, dir: &Path) -> Result<(), String> {
+/// Одна проверка: есть ли выпуск новее, и если есть — поставить. Правда —
+/// нашёлся и установщик запущен.
+fn check(store: &Store, dir: &Path) -> Result<bool, String> {
     let manifest = fetch(MANIFEST, MANIFEST_LIMIT)?;
     let signature = fetch(SIGNATURE, SIGNATURE_LIMIT)?;
     if !verify(&manifest, &signature, MODULUS) {
@@ -358,7 +405,7 @@ fn check(store: &Store, dir: &Path) -> Result<(), String> {
     }
     let release = Manifest::parse(&manifest)?;
     if !newer(release.build) {
-        return Ok(());
+        return Ok(false);
     }
     store.log(&format!(
         "обновления: есть сборка {} (версия {}), у нас {BUILD} — скачиваю",
@@ -388,14 +435,14 @@ fn check(store: &Store, dir: &Path) -> Result<(), String> {
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|e| format!("установщик не запустился: {e}"))?;
-    Ok(())
+    Ok(true)
 }
 
 /// `vpnsplit-svc update …` — посмотреть и проверить без службы.
-pub fn command(store: &Store, first: Option<&String>, second: Option<&String>, third: Option<&String>) -> Result<(), String> {
+pub fn command(first: Option<&String>, second: Option<&String>, third: Option<&String>) -> Result<(), String> {
     match (first.map(String::as_str), second, third) {
         (None, ..) => {
-            println!("{}", describe(store));
+            println!("{}", describe(&data_dir()));
             Ok(())
         }
         // Проверка подписи выпуска тем же кодом, каким её проверит служба.
@@ -434,7 +481,7 @@ pub fn command(store: &Store, first: Option<&String>, second: Option<&String>, t
             );
             Ok(())
         }
-        _ => Err("update | update look | update verify ОПИСАНИЕ ПОДПИСЬ".to_owned()),
+        _ => Err("update | update now | update look | update verify ОПИСАНИЕ ПОДПИСЬ".to_owned()),
     }
 }
 

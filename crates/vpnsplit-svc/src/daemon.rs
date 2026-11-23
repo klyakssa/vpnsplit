@@ -1405,6 +1405,17 @@ fn handle(mut connection: Connection, shared: Arc<Shared>) {
                 Ok(()) => Response::Ok,
                 Err(e) => Response::Error(e),
             },
+            Request::CheckUpdate => {
+                if crate::update::check_now() {
+                    Response::Ok
+                } else {
+                    Response::Error(
+                        "эта копия обновлений не ищет: она не установлена установщиком или \
+                         собрана для разработки"
+                            .to_owned(),
+                    )
+                }
+            }
             // Логин и пароль дальше этой строки не идут.
             Request::SetVpnLogin { name, login } => {
                 match shared.vpn.set_login(&name, &login.user.0, &login.password.0) {
