@@ -159,6 +159,8 @@ pub struct App {
     /// Поднят ли перехват пути B. Без него правила «приложение и все его
     /// потомки» не работают вовсе.
     divert: bool,
+    /// Почему перехват не поднялся — словами службы.
+    divert_error: Option<String>,
     /// Правила пути B, под которыми прямо сейчас есть хоть один процесс.
     /// Поднятый перехват этого не обещает: программу могли запустить
     /// раньше правила или раньше службы, значок-запускатель мог лишь
@@ -240,6 +242,7 @@ impl App {
             tunnel: TunnelState::Down,
             killswitch: false,
             divert: false,
+            divert_error: None,
             supervised: Vec::new(),
             policy: Policy::default(),
             processes: HashMap::new(),
@@ -596,13 +599,18 @@ impl App {
         // не поднялся, правила в списке есть, а защиты нет — и молчать об
         // этом нельзя: список выглядел бы работающим.
         if self.linked && !self.divert && self.policy.needs_divert() {
-            warnings.push(
-                "Правила «приложение и все его потомки» в списке есть, но перехват не \
-                 поднят — эти приложения идут мимо VPN. Чаще всего это значит, что \
-                 служба работает без прав администратора или нет драйвера WinDivert; \
-                 подробности — в журнале службы."
+            // Причину называет сама служба; «смотри журнал» — не ответ тому,
+            // кто видит программу первый раз.
+            let why = match &self.divert_error {
+                Some(reason) => format!("Причина: {reason}."),
+                None => "Чаще всего это значит, что служба работает без прав администратора \
+                         или не загрузился драйвер WinDivert; подробности — в журнале службы."
                     .to_owned(),
-            );
+            };
+            warnings.push(format!(
+                "Правила «приложение и все его потомки» в списке есть, но перехват не \
+                 поднят — эти приложения идут мимо VPN. {why}"
+            ));
         }
 
         set_text(self.status, &status);
@@ -1628,6 +1636,7 @@ impl App {
             Reply::State(status) => {
                 // Служба новее окна — значит, обновление уже поставлено и
                 // файл окна подменён: пора стать новым и самому.
+                self.divert_error = status.divert_error.clone();
                 let newer = vpnsplit_core::BUILD != 0 && status.build > vpnsplit_core::BUILD;
                 if newer && !AFTER_UPDATE.swap(true, std::sync::atomic::Ordering::AcqRel) {
                     self.restart_updated();

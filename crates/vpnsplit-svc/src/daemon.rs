@@ -79,6 +79,10 @@ pub struct Shared {
     /// Состояние подключений, каким его разослали в последний раз: о том,
     /// что не изменилось, подписчикам не сообщается.
     vpn_seen: Mutex<Vec<vpnsplit_core::VpnState>>,
+    /// Почему перехват (путь B) не поднялся, если не поднялся. Окно
+    /// показывает это человеку: «подробности в журнале» на чужой машине —
+    /// не ответ.
+    divert_error: Mutex<Option<String>>,
 }
 
 /// Как часто пишущий родословную просыпается без повода — проверить, не
@@ -322,6 +326,7 @@ pub fn start(store: Store) -> Result<Daemon, String> {
     let shared = Arc::new(Shared {
         vpn,
         vpn_seen: Mutex::new(Vec::new()),
+        divert_error: Mutex::new(None),
         state: Mutex::new(State { policy, tunnel, processes: Table::default() }),
         subscribers: Mutex::new(Vec::new()),
         store,
@@ -882,6 +887,7 @@ impl Shared {
             killswitch,
             vpns,
             build: vpnsplit_core::BUILD,
+            divert_error: self.divert_error.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         }
     }
 
@@ -1048,8 +1054,10 @@ impl Shared {
             shared
                 .store
                 .log(&format!("{why}: путь B НЕ поднялся — {e}. Приложения из списка идут мимо туннеля"));
+            *shared.divert_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
             return;
         }
+        *shared.divert_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *shared.engine.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(EngineSlot { engine, from_policy: true });
         shared.store.log(&format!("{why}: путь B поднят по списку"));

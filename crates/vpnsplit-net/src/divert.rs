@@ -14,10 +14,19 @@
 //!   молча оборвать связь всему, что попало под фильтр. Поэтому фильтр
 //!   держим узким, а время жизни ручки — ограниченным.
 //!
-//! **Драйвер мы не ставим.** Флаг `NO_INSTALL` означает «открой уже
-//! загруженный». На этой машине WinDivert 2.2 уже работает: его держат
-//! `zapret` и `VpnClient`. Ставить свою копию поверх чужой службы с тем же
-//! именем — верный способ сломать обе.
+//! **Драйвер ставит сама библиотека — и только когда его нет.** WinDivert
+//! сначала пробует открыть уже загруженный драйвер; если такого нет,
+//! заводит службу драйвера из `WinDivert64.sys`, лежащего рядом с
+//! `WinDivert.dll`. Чужую копию (на машине разработчика драйвер держат
+//! `zapret` и `VpnClient`) это не трогает: раз драйвер открылся, ставить
+//! нечего.
+//!
+//! До 23.11.2026 мы открывали ручки с флагом `NO_INSTALL` — «только уже
+//! загруженный» — из опасения сломать чужую службу с тем же именем. На
+//! машине разработчика это работало именно потому, что драйвер там уже
+//! загрузил `zapret`. На первой же чистой машине перехват не поднялся
+//! вовсе: `WinDivertOpen` вернул 1060, «службы нет», и приложение из
+//! списка молча пошло мимо VPN.
 //!
 //! Библиотека грузится вручную, а не линкуется: без неё служба должна
 //! спокойно работать дальше, а не отказываться запускаться.
@@ -37,7 +46,6 @@ pub const LAYER_SOCKET: u8 = 3;
 
 const FLAG_SNIFF: u64 = 0x0001;
 const FLAG_RECV_ONLY: u64 = 0x0004;
-const FLAG_NO_INSTALL: u64 = 0x0010;
 
 /// События слоёв FLOW и SOCKET.
 const EVENT_ESTABLISHED: u8 = 1;
@@ -310,26 +318,26 @@ unsafe impl Sync for Handle {}
 impl Handle {
     /// Только чтение событий сокетов.
     pub fn sniff_sockets(filter: &str) -> Result<Handle, String> {
-        Self::open(filter, LAYER_SOCKET, FLAG_SNIFF | FLAG_RECV_ONLY | FLAG_NO_INSTALL)
+        Self::open(filter, LAYER_SOCKET, FLAG_SNIFF | FLAG_RECV_ONLY)
     }
 
     /// Только чтение событий потоков: открытие и закрытие, с полной
     /// пятёркой и номером процесса.
     pub fn sniff_flows(filter: &str) -> Result<Handle, String> {
-        Self::open(filter, LAYER_FLOW, FLAG_SNIFF | FLAG_RECV_ONLY | FLAG_NO_INSTALL)
+        Self::open(filter, LAYER_FLOW, FLAG_SNIFF | FLAG_RECV_ONLY)
     }
 
     /// Только чтение пакетов: копии приходят нам, а сами пакеты идут своей
     /// дорогой. Для замеров это единственный безопасный способ смотреть на
     /// слой пакетов — забыть отправить обратно здесь нечего.
     pub fn sniff_network(filter: &str) -> Result<Handle, String> {
-        Self::open(filter, LAYER_NETWORK, FLAG_SNIFF | FLAG_RECV_ONLY | FLAG_NO_INSTALL)
+        Self::open(filter, LAYER_NETWORK, FLAG_SNIFF | FLAG_RECV_ONLY)
     }
 
     /// Рабочий режим на слое пакетов: что пришло — исчезло из сети, пока не
     /// отправлено обратно. Фильтр должен быть узким.
     pub fn intercept_network(filter: &str) -> Result<Handle, String> {
-        Self::open(filter, LAYER_NETWORK, FLAG_NO_INSTALL)
+        Self::open(filter, LAYER_NETWORK, 0)
     }
 
     fn open(filter: &str, layer: u8, flags: u64) -> Result<Handle, String> {
@@ -497,8 +505,8 @@ impl Drop for Handle {
 
 fn describe_open(code: u32) -> String {
     match code {
-        2 => "драйвер WinDivert не загружен. Своей копии мы не ставим: \
-              открываем только уже работающий"
+        2 => "драйвер WinDivert не загружен, а поставить его нечем: рядом с \
+              WinDivert.dll нет WinDivert64.sys (его мог убрать антивирус)"
             .to_owned(),
         5 => "отказано в доступе — WinDivert открывается только из-под SYSTEM \
               или администратора"
@@ -506,6 +514,17 @@ fn describe_open(code: u32) -> String {
         87 => "WinDivert не принял фильтр".to_owned(),
         577 => "подпись драйвера отклонена (так выглядит отказ при включённой \
                 проверке целостности памяти)"
+            .to_owned(),
+        654 => "прежняя копия драйвера WinDivert ещё выгружается — поможет \
+                перезагрузка"
+            .to_owned(),
+        1060 => "драйвер WinDivert не загружен".to_owned(),
+        1275 => "Windows или защитная программа запретили загружать драйвер \
+                 WinDivert (так бывает при антивирусе и при включённой \
+                 целостности памяти)"
+            .to_owned(),
+        1753 => "выключена служба Windows «Служба базовой фильтрации» — без \
+                 неё WinDivert не работает"
             .to_owned(),
         other => format!("WinDivertOpen вернул код {other}"),
     }
@@ -597,6 +616,8 @@ mod tests {
     fn open_errors_are_explained() {
         assert!(describe_open(5).contains("SYSTEM"));
         assert!(describe_open(577).contains("целостности"));
+        assert!(describe_open(2).contains("WinDivert64.sys"));
+        assert!(describe_open(1275).contains("запретили"));
         assert!(describe_open(12345).contains("12345"));
     }
 }

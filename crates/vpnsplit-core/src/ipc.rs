@@ -209,6 +209,9 @@ pub struct VpnState {
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+// One big variant (the full status) among small ones: these are messages
+// that live for a moment, boxing them would buy nothing.
+#[allow(clippy::large_enum_variant)]
 pub enum Response {
     Ok,
     Status(Status),
@@ -340,6 +343,10 @@ pub struct Status {
     /// службу новее себя, перезапускается: обновление заменило и его файл.
     #[serde(default)]
     pub build: u64,
+    /// Почему перехват не поднялся, словами. `None` — он работает или не
+    /// нужен.
+    #[serde(default)]
+    pub divert_error: Option<String>,
 }
 
 /// Сеть одного правила «приложение и все его потомки» глазами службы.
@@ -459,6 +466,7 @@ impl Default for Status {
             killswitch: false,
             vpns: Vec::new(),
             build: 0,
+            divert_error: None,
         }
     }
 }

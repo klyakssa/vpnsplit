@@ -24,6 +24,9 @@ pub const WM_TRAY: u32 = WM_APP + 4;
 /// секунды, то есть вдвое реже разрешённого 1 Гц.
 const RETRY: std::time::Duration = std::time::Duration::from_secs(2);
 
+// One big variant (the full status) among small ones: these are messages
+// that live for a moment, boxing them would buy nothing.
+#[allow(clippy::large_enum_variant)]
 pub enum Reply {
     Policy(Policy),
     State(Status),
