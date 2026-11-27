@@ -5,7 +5,6 @@ mod dnsprobe;
 mod flows;
 mod flushprobe;
 mod lanes;
-mod net;
 mod probe;
 mod procs;
 mod redirect;
@@ -16,8 +15,6 @@ mod udpprobe;
 mod update;
 mod update_key;
 mod vpn;
-mod wg;
-mod wgcli;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -64,7 +61,6 @@ fn main() -> ExitCode {
         "dns" => probe_dns(args.get(1), args.get(2)),
         "udp" => probe_udp(args.get(1)),
         "flush" => probe_flush(args.get(1)),
-        "wg-up" => wgcli::cmd_up(wgcli::config_path(&args)).map_err(|e| e.to_string()),
         "help" | "--help" | "-h" => {
             print_help();
             Ok(())
@@ -137,9 +133,6 @@ fn print_help() {
     println!("flush, reroute) служба принимает только из окна с правами администратора: они");
     println!("перехватывают чужие пакеты или отрезают приложения от сети. Состояние и");
     println!("список доступны без прав.");
-    println!();
-    println!("Запас:");
-    println!("  wg-up [.conf]    поднять собственный туннель WireGuardNT");
 }
 
 fn run_console() -> Result<(), String> {
