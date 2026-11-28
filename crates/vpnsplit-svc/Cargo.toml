@@ -6,6 +6,9 @@ edition.workspace = true
 [dependencies]
 vpnsplit-core = { workspace = true }
 vpnsplit-net = { workspace = true }
+# Признак «хуки поставлены» читается из чужого процесса тем же разбором
+# таблицы экспорта, что и при внедрении.
+vpnsplit-inject = { workspace = true }
 serde_json = "1"
 windows-service = "0.8"
 
@@ -27,6 +30,8 @@ features = [
     # службой» и останавливается по именованному событию.
     "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
+    # Профили пользователей: чьи программы правит обычный клиент.
+    "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ]

@@ -15,11 +15,14 @@
 
 use crate::procs::{self, Running, Table};
 use crate::store::Store;
-use std::sync::mpsc::{channel, Sender};
+use std::collections::{HashMap, VecDeque};
+use std::sync::mpsc::{sync_channel, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use vpnsplit_core::{Event, Policy, Request, Response, Status, TunnelState};
 use vpnsplit_net::etw::{ProcessEvent, ProcessWatcher};
 use vpnsplit_net::pipe::{Connection, Instance, Server};
+use vpnsplit_net::stall::{Remote, Watch};
 use vpnsplit_net::watch::Watcher;
 use vpnsplit_net::wfp;
 
@@ -35,7 +38,8 @@ struct State {
 
 pub struct Shared {
     state: Mutex<State>,
-    subscribers: Mutex<Vec<Sender<Event>>>,
+    /// Очереди подписчиков и чем прервать запись того, кто не читает.
+    subscribers: Mutex<Vec<(SyncSender<Event>, Remote)>>,
     store: Store,
     /// Kill-switch. `None` — движок фильтрации открыть не удалось (в
     /// консоли без прав администратора это обычное дело), и тогда защиты
@@ -49,6 +53,37 @@ pub struct Shared {
     image_check: Mutex<ParentCheck>,
     /// Работающий путь B, если он сейчас включён.
     engine: Mutex<Option<EngineSlot>>,
+    /// Решения о движке пути B — по одному за раз: «посмотреть в ячейку,
+    /// собрать и запустить движок, положить его туда» (`refresh_engine`,
+    /// `path_b`) и «забрать и остановить». Без этого два одновременных
+    /// SetPolicy оба видели пустую ячейку и поднимали два движка, и один
+    /// из них, выброшенный из ячейки, продолжал перехватывать без присмотра.
+    ///
+    /// Порядок замков: `policy_serial` → `engine_serial` → всё остальное
+    /// (`state`, ячейка `engine`, `divert_error`). Держащий его ждёт
+    /// остановки рабочих потоков движка и открытия ручек; ни рабочие потоки,
+    /// ни поток ETW этот замок не берут, поэтому ждать их под ним можно.
+    /// Сам опыт (`path_b`) свои секунды под ним не спит.
+    engine_serial: Mutex<()>,
+    /// Запись о тех, кто был под присмотром до остановки службы, ещё не
+    /// прочитана. Читает её (и удаляет файл) тот `refresh_engine`, который
+    /// первым после старта действительно создаёт движок, — под
+    /// `engine_serial`: канал работает раньше, чем старт доходит до пути B,
+    /// и SetPolicy, успевший первым, иначе поднимал движок без неё, а
+    /// стартовый вызов находил движок готовым и выбрасывал её.
+    family_unread: std::sync::atomic::AtomicBool,
+    /// Правки списка (SetPolicy) — по одной за раз, целиком: проверка,
+    /// запись на диск, состояние и всё, что от списка зависит. Иначе две
+    /// одновременные правки могли оставить на диске одну политику, а в
+    /// памяти другую. Берётся первым, раньше всех остальных замков.
+    policy_serial: Mutex<()>,
+    /// Запись `learned.json` и `alone.json` — по одной за раз, со снимком,
+    /// снятым уже под этим замком: последней на диск ложится самая свежая
+    /// копия. Сами данные под своими замками на время записи не держатся —
+    /// их на каждый запуск процесса спрашивает поток ETW. Берутся раньше
+    /// замков `learned` и `alone`.
+    learned_disk: Mutex<()>,
+    alone_disk: Mutex<()>,
     /// Программы, виденные под правилами пути B. Нужны запретам на время
     /// простоя: правило называет одну программу, а ведёт и её потомков; у
     /// правила на значок-запускатель настоящая программа вообще другая.
@@ -114,7 +149,7 @@ fn keep_family(service: std::sync::Weak<Shared>) {
         if shared.leaving.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
-        let Some(engine) = shared.from_policy_engine() else {
+        let Some(engine) = shared.policy_engine() else {
             drop(shared);
             std::thread::sleep(FAMILY_POLL);
             continue;
@@ -231,7 +266,7 @@ impl Drop for Daemon {
         // интернетом.
         self.shared.vpn.shutdown();
         let _serial = self.shared.family_serial.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(engine) = self.shared.from_policy_engine() {
+        if let Some(engine) = self.shared.policy_engine() {
             let members = engine.export();
             match self.shared.store.save_family(&members) {
                 Ok(()) => self.shared.store.log(&format!(
@@ -247,6 +282,10 @@ impl Drop for Daemon {
                 )),
             }
         }
+        // Под замком решений о движке: правка списка, начатая до нас,
+        // успеет положить свой движок — и он будет остановлен здесь же, а
+        // начатые после увидят, что служба уходит (`refresh_engine`).
+        let _engine = self.shared.engine_serial.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(engine) = self.shared.engine() {
             let stats = engine.stop();
             self.shared
@@ -277,6 +316,12 @@ pub fn start(store: Store) -> Result<Daemon, String> {
     // об этом надо узнать сразу и ничего не писать в журнал.
     let server = Server::new()?;
     let first = server.create_instance()?;
+    // До первого фильтра: каждое приложение перед ним сверяется с тем
+    // файлом, который нашла Windows (см. `rights::vet`).
+    wfp::vet_apps(crate::rights::vet);
+    // Канал наш — значит, другой службы, которая могла бы писать в этот
+    // каталог прямо сейчас, нет, и временные файлы в нём — остатки.
+    store.sweep_leftovers();
 
     let policy = store.load();
     let tunnel = vpnsplit_net::detect_tunnel(None);
@@ -334,6 +379,11 @@ pub fn start(store: Store) -> Result<Daemon, String> {
         parent_check: Mutex::new(ParentCheck::default()),
         image_check: Mutex::new(ParentCheck::default()),
         engine: Mutex::new(None),
+        engine_serial: Mutex::new(()),
+        family_unread: std::sync::atomic::AtomicBool::new(true),
+        policy_serial: Mutex::new(()),
+        learned_disk: Mutex::new(()),
+        alone_disk: Mutex::new(()),
         learned: Mutex::new(learned),
         alone: Mutex::new(alone),
         standing: Mutex::new(Vec::new()),
@@ -384,11 +434,17 @@ pub fn start(store: Store) -> Result<Daemon, String> {
     // И туннеля могло не быть ещё до нашего запуска.
     shared.refresh_killswitch();
     // А путь B нужен ровно тогда, когда в списке есть его правила. Запись
-    // о тех, кто был под присмотром до остановки, читается в любом случае
-    // и только здесь: она верна для одного запуска, следующего за
-    // остановкой, и лежать до лучших времён ей незачем.
-    let remembered = shared.store.take_family();
-    Shared::refresh_engine(&shared, "старт", &remembered);
+    // о тех, кто был под присмотром до остановки, забирает себе тот, кто
+    // создаёт движок (см. `family_unread`); не создал никто — она всё
+    // равно читается и удаляется здесь: она верна для одного запуска,
+    // следующего за остановкой, и лежать до лучших времён ей незачем.
+    Shared::refresh_engine(&shared, "старт");
+    {
+        let _serial = shared.engine_serial.lock().unwrap_or_else(|e| e.into_inner());
+        if shared.family_unread.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            let _ = shared.store.take_family();
+        }
+    }
     // Запреты на время простоя могли остаться на программах, которые
     // работают и сами по себе: пока службы не было, заметить это было
     // некому. Сейчас, когда родословная восстановлена, это видно.
@@ -492,13 +548,32 @@ impl Shared {
     /// Это страховка от того, чего хук не видит: приложение из списка,
     /// запущенное мимо лончера, хуков не имеет вовсе и без фильтра
     /// спокойно пойдёт через домашний интернет.
+    ///
+    /// Замок фильтров берётся **первым**, и состояние читается уже под ним
+    /// (порядок `guard` → `state`; обратного нигде нет). Иначе вызов,
+    /// прочитавший «туннеля нет» и вытесненный, мог взять замок после того,
+    /// кто уже увидел туннель поднятым и снял запреты, — и поставить их при
+    /// живом туннеле.
+    ///
+    /// Запреты приводятся к нужным разностью: сначала ставятся недостающие,
+    /// потом снимаются лишние, а стоящие не трогаются. Снять всё и поставить
+    /// заново значило бы на время пересоздания оставить приложения из
+    /// списка при упавшем туннеле без запрета.
     fn refresh_killswitch(&self) {
+        let mut guard = self.guard.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(guard) = guard.as_mut() else {
+            return;
+        };
         let (down, apps) = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let apps: Vec<std::path::PathBuf> = state
                 .policy
                 .rules
                 .iter()
+                // Как и у запретов на время простоя: правило «напрямую»
+                // просили пускать мимо туннеля, и без туннеля оно сеть не
+                // теряет.
+                .filter(|rule| rule.routing == vpnsplit_core::Routing::Tunnel)
                 .filter_map(|rule| match &rule.target {
                     vpnsplit_core::AppTarget::Executable(path) => Some(path.clone()),
                     vpnsplit_core::AppTarget::Package(_) => None,
@@ -507,13 +582,9 @@ impl Shared {
             (matches!(state.tunnel, TunnelState::Down), apps)
         };
 
-        let mut guard = self.guard.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(guard) = guard.as_mut() else {
-            return;
-        };
-        let had = guard.blocked();
-        guard.clear();
         if !down {
+            let had = guard.blocked();
+            guard.clear();
             if had > 0 {
                 // Это и возвращение туннеля, и конец проверки — оба случая
                 // приходят сюда, и называть причину мы не вправе.
@@ -528,6 +599,8 @@ impl Shared {
                 self.store.log(&format!("kill-switch: {} — {e}", app.display()));
             }
         }
+        // Лишние — после: убранные из списка и проверочный запрет.
+        guard.unblock_except(&apps);
         if !apps.is_empty() {
             self.store.log(&format!(
                 "kill-switch: туннеля нет, приложений под запретом {} из {}",
@@ -559,20 +632,41 @@ impl Shared {
                 state.policy.divert_targets().iter().map(|target| target.key()).collect();
             (apps, rules)
         };
-        let mut learned = self.learned.lock().unwrap_or_else(|e| e.into_inner());
-        let before = learned.len();
-        learned.retain(|rule, _| rules.contains(rule));
-        if learned.len() != before {
-            if let Err(e) = self.store.save_learned(&learned) {
-                self.store.log(&format!("не удалось записать виденные программы: {e}"));
-            }
+        let forgot = {
+            let mut learned = self.learned.lock().unwrap_or_else(|e| e.into_inner());
+            let before = learned.len();
+            learned.retain(|rule, _| rules.contains(rule));
+            apps.extend(learned.values().flat_map(|images| images.values().cloned()));
+            learned.len() != before
+        };
+        if forgot {
+            self.persist_learned();
         }
-        apps.extend(learned.values().flat_map(|images| images.values().cloned()));
-        drop(learned);
         // Одна программа может прийти и как цель правила, и как виденная.
         let mut seen = std::collections::HashSet::new();
         apps.retain(|app| seen.insert(app.to_string_lossy().to_lowercase()));
         apps
+    }
+
+    /// Записывает виденные программы на диск — нынешние, снятые уже под
+    /// замком записи. Две записи подряд из разных потоков поэтому не могут
+    /// лечь в обратном порядке: какая бы ни была последней, она пишет
+    /// самое свежее. Звать без замка `learned`.
+    fn persist_learned(&self) {
+        let _disk = self.learned_disk.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot = self.learned.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Err(e) = self.store.save_learned(&snapshot) {
+            self.store.log(&format!("не удалось записать виденные программы: {e}"));
+        }
+    }
+
+    /// То же для программ «сами по себе». Звать без замка `alone`.
+    fn persist_alone(&self) {
+        let _disk = self.alone_disk.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot = self.alone.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Err(e) = self.store.save_alone(&snapshot) {
+            self.store.log(&format!("не удалось записать программы «сами по себе»: {e}"));
+        }
     }
 
     /// Приводит запреты на время простоя в согласие со списком.
@@ -586,6 +680,13 @@ impl Shared {
     /// живой службе, — это поломка, а не защита.
     fn refresh_standing(shared: &Arc<Shared>, why: &str) {
         let _serial = shared.standing_serial.lock().unwrap_or_else(|e| e.into_inner());
+        // Служба уходит — запреты больше не пересматриваются. Её могут
+        // удалять: `uninstall` снимает запреты после остановки, и
+        // поставленный сейчас запрет пережил бы службу, которая его уже
+        // никогда не снимет.
+        if shared.leaving.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         let apps = shared.standing_apps();
         let mut permitted = Vec::new();
         {
@@ -603,10 +704,21 @@ impl Shared {
                     )),
                 }
             }
-            guard.revoke_alive_except(&permitted);
         }
 
         let outcome = wfp::Standing::open().and_then(|standing| standing.sync(&permitted));
+        // У убранных из списка разрешение снимается только **после** того,
+        // как с них снят постоянный запрет: в обратном порядке у работающего
+        // приложения на миг остался бы один запрет, и Windows оборвала бы
+        // его соединения. А если запреты обновить не удалось, разрешения
+        // остаются как были: иначе приложение, которого в списке уже нет,
+        // осталось бы при живой службе без сети.
+        if outcome.is_ok() {
+            let mut guard = shared.guard.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(guard) = guard.as_mut() {
+                guard.revoke_alive_except(&permitted);
+            }
+        }
         match outcome {
             Ok(change) => {
                 let failed: Vec<&std::path::PathBuf> = change.failed.iter().map(|(app, _)| app).collect();
@@ -649,7 +761,7 @@ impl Shared {
     /// каталога Windows — запомнить и закрыть ей сеть на время простоя.
     ///
     /// Зовётся из потоков движка, иногда с пакетом в руках, поэтому сама
-    /// работа с фильтрами уходит в отдельный поток. Новая программа под
+    /// работа с фильтрами и запись на диск уходят в отдельный поток. Новая программа под
     /// правилом — редкость: у браузера их две-три за всю жизнь правила.
     ///
     /// `alone_now` — эта же программа прямо сейчас работает и вне правил.
@@ -667,7 +779,7 @@ impl Shared {
             Shared::set_free(shared, image, "замечена под правилом, но работает и вне его");
             return;
         }
-        let snapshot = {
+        {
             let mut learned = shared.learned.lock().unwrap_or_else(|e| e.into_inner());
             let images = learned.entry(rule.to_owned()).or_default();
             let key = image.to_string_lossy().to_lowercase();
@@ -675,24 +787,24 @@ impl Shared {
                 return;
             }
             images.insert(key, image.to_owned());
-            learned.clone()
-        };
-        if let Err(e) = shared.store.save_learned(&snapshot) {
-            shared.store.log(&format!("не удалось записать виденные программы: {e}"));
         }
         shared.store.log(&format!(
             "под правилом {rule} замечена программа {} — на время простоя службы сеть ей \
              будет закрыта",
             image.display()
         ));
-        let shared = shared.clone();
-        let spawned = std::thread::Builder::new()
-            .name("standing".into())
-            .spawn(move || Shared::refresh_standing(&shared, "новая программа под правилом"));
+        // И запись на диск — в том же потоке, что и пересмотр: она ждёт
+        // сброса файла на диск, а держать столько пакет нельзя.
+        let worker = shared.clone();
+        let spawned = std::thread::Builder::new().name("standing".into()).spawn(move || {
+            worker.persist_learned();
+            Shared::refresh_standing(&worker, "новая программа под правилом");
+        });
         if let Err(e) = spawned {
             // Запрет встанет при следующем пересмотре — при правке списка
-            // или старте службы; программа уже записана.
+            // или старте службы; программа записывается здесь же.
             eprintln!("не удалось завести поток запретов: {e}");
+            shared.persist_learned();
         }
     }
 
@@ -707,18 +819,17 @@ impl Shared {
     /// образ всё равно закрывал бы не только «свой» запуск.
     fn set_free(shared: &Arc<Shared>, image: &std::path::Path, why: &str) {
         let key = image.to_string_lossy().to_lowercase();
-        let known = {
+        let fresh = {
             let mut alone = shared.alone.lock().unwrap_or_else(|e| e.into_inner());
             if alone.contains_key(&key) {
-                None
+                false
             } else {
                 alone.insert(key.clone(), image.to_owned());
-                Some(alone.clone())
+                true
             }
         };
-        let Some(known) = known else { return };
-        if let Err(e) = shared.store.save_alone(&known) {
-            shared.store.log(&format!("не удалось записать программы «сами по себе»: {e}"));
+        if !fresh {
+            return;
         }
         let forgotten = {
             let mut learned = shared.learned.lock().unwrap_or_else(|e| e.into_inner());
@@ -726,23 +837,30 @@ impl Shared {
             for images in learned.values_mut() {
                 removed |= images.remove(&key).is_some();
             }
-            removed.then(|| learned.clone())
+            removed
         };
         shared.store.log(&format!(
             "программа {} {why} — сеть на время простоя службы ей не закрывается{}",
             image.display(),
-            if forgotten.is_some() { "; запрет снимается" } else { "" }
+            if forgotten { "; запрет снимается" } else { "" }
         ));
-        let Some(forgotten) = forgotten else { return };
-        if let Err(e) = shared.store.save_learned(&forgotten) {
-            shared.store.log(&format!("не удалось записать виденные программы: {e}"));
-        }
-        let shared = shared.clone();
-        let spawned = std::thread::Builder::new()
-            .name("standing".into())
-            .spawn(move || Shared::refresh_standing(&shared, "программа работает и сама по себе"));
+        // Запись на диск и пересмотр запретов — в своём потоке, как и в
+        // `learn`: сюда приходят и из потоков движка, и из потока ETW, а
+        // запись ждёт сброса файла на диск.
+        let worker = shared.clone();
+        let spawned = std::thread::Builder::new().name("standing".into()).spawn(move || {
+            worker.persist_alone();
+            if forgotten {
+                worker.persist_learned();
+                Shared::refresh_standing(&worker, "программа работает и сама по себе");
+            }
+        });
         if let Err(e) = spawned {
             eprintln!("не удалось завести поток запретов: {e}");
+            shared.persist_alone();
+            if forgotten {
+                shared.persist_learned();
+            }
         }
     }
 
@@ -785,7 +903,7 @@ impl Shared {
     /// Пересмотр запомненных программ при старте службы: кто из них прямо
     /// сейчас работает вне правил.
     fn review_learned(shared: &Arc<Shared>) {
-        let Some(engine) = shared.from_policy_engine() else { return };
+        let Some(engine) = shared.policy_engine() else { return };
         let images: Vec<std::path::PathBuf> = shared
             .learned
             .lock()
@@ -834,16 +952,28 @@ impl Shared {
     fn broadcast(&self, event: Event) {
         let mut subscribers = self.subscribers.lock().unwrap_or_else(|e| e.into_inner());
         // Отправка в канал отписавшегося клиента не удаётся — он и выпадает.
-        subscribers.retain(|tx| tx.send(event.clone()).is_ok());
+        // Так же выпадает и тот, кто подписался, но не читает: его очередь
+        // полна, и копить для него события дальше значило бы растить
+        // память службы без предела. Его поток, скорее всего, завис на
+        // записи в канал (буфер канала полон): запись прерывается сторожем,
+        // иначе поток и место его пользователя висели бы, пока клиент жив.
+        subscribers.retain(|(tx, remote)| match tx.try_send(event.clone()) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                remote.doom();
+                false
+            }
+            Err(TrySendError::Disconnected(_)) => false,
+        });
     }
 
     fn status(&self) -> Status {
-        // Замок kill-switch берётся первым и отпускается: порядок «сначала
-        // состояние, потом фильтры» соблюдается везде, кроме этого места,
-        // и смешивать их было бы приглашением к взаимной блокировке.
+        // Замок kill-switch берётся первым и отпускается до замка
+        // состояния. Вложенно они берутся только в `refresh_killswitch`, и
+        // там порядок тот же: сначала фильтры, потом состояние.
         let killswitch = self.killswitch_on();
         // Так же и путь B: замок его ячейки берётся до замка состояния.
-        let engine = self.from_policy_engine();
+        let engine = self.policy_engine();
         let divert = self.engine().map(|engine| engine.summary());
         let live = engine.as_ref().map(|engine| engine.live_rules()).unwrap_or_default();
         let counted = engine.map(|engine| engine.rule_traffic()).unwrap_or_default();
@@ -874,7 +1004,7 @@ impl Shared {
                 })
             })
             .collect();
-        Status {
+        let mut status = Status {
             standing,
             alone: self.alone.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect(),
             traffic,
@@ -888,7 +1018,16 @@ impl Shared {
             vpns,
             build: vpnsplit_core::BUILD,
             divert_error: self.divert_error.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        };
+        drop(state);
+        // DNS подключения — для лончера: он передаст его hook.dll. В
+        // `state.tunnel` его нет намеренно: туннель сравнивается при каждой
+        // перемене сети, а журнал OpenVPN читается с диска, и делать это
+        // стоит только по вопросу и без замка состояния.
+        if let TunnelState::Up(info) = &mut status.tunnel {
+            info.dns = self.vpn.dns_of(&info.name);
         }
+        status
     }
 
     /// Правила списка, под которыми сейчас кто-то есть: движок называет их
@@ -908,7 +1047,7 @@ impl Shared {
 
     /// Движок, поднятый по списку. Движок опыта сюда не годится: его
     /// «правило» — подстрока, и к целям списка она отношения не имеет.
-    fn from_policy_engine(&self) -> Option<Arc<crate::redirect::Engine>> {
+    fn policy_engine(&self) -> Option<Arc<crate::redirect::Engine>> {
         self.engine
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -960,10 +1099,23 @@ impl Shared {
     /// не поднимается и не гасится сам по себе: решает это список, и
     /// только он.
     ///
-    /// `remembered` — кто был под присмотром до остановки службы; не пусто
-    /// только при старте. Без этого перезапуск службы оставлял без
-    /// присмотра всё, что запущено запускателем из списка.
-    fn refresh_engine(shared: &Arc<Shared>, why: &str, remembered: &[crate::flows::Remembered]) {
+    /// Создающий движок вызов первым после старта восстанавливает в нём
+    /// тех, кто был под присмотром до остановки службы (`family_unread`),
+    /// — кто бы это ни был: стартовый вызов или успевший раньше SetPolicy.
+    /// Без этого перезапуск службы оставлял без присмотра всё, что запущено
+    /// запускателем из списка.
+    ///
+    /// Всё решение — под `engine_serial`, от взгляда в ячейку до того, как
+    /// движок в ней лёг или из неё ушёл и остановился: иначе два вызова
+    /// разом оба видели пустую ячейку и поднимали по движку. Список
+    /// читается уже под ним — решает самый свежий.
+    fn refresh_engine(shared: &Arc<Shared>, why: &str) {
+        let _serial = shared.engine_serial.lock().unwrap_or_else(|e| e.into_inner());
+        // Служба уходит: движок, поднятый сейчас, остановить было бы уже
+        // некому.
+        if shared.leaving.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         let (targets, mode) = {
             let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
             (state.policy.divert_targets(), state.policy.mode)
@@ -1039,8 +1191,11 @@ impl Shared {
             Some(learner),
         );
         // До начала перехвата: первое же соединение должно застать
-        // родословную уже восстановленной.
-        engine.restore(remembered);
+        // родословную уже восстановленной. Под `engine_serial` — поэтому
+        // запись достаётся ровно одному движку.
+        if shared.family_unread.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            engine.restore(&shared.store.take_family());
+        }
         // И дорожки — до начала: первое же соединение должно уйти в своё
         // подключение, а не в то, которое нашлось.
         {
@@ -1066,35 +1221,55 @@ impl Shared {
     /// Опыт из консоли: включить путь B на заданное время по подстроке.
     /// В бою движком распоряжается список, а это нужно для замеров.
     fn path_b(shared: &Arc<Shared>, target: &str, seconds: u32) -> Result<String, String> {
-        // Движок собирается до взятия замка: он обходит все процессы
-        // системы, а на этом замке висит обработчик запуска процессов.
-        let engine = crate::redirect::Engine::new(
-            shared.store.clone(),
-            crate::redirect::Watch::Needle(target.to_lowercase()),
-            // Опыт окну не докладывает и запретов не заводит: его цель —
-            // не правило из списка.
-            None,
-            None,
-        );
         {
-            let mut slot = shared.engine.lock().unwrap_or_else(|e| e.into_inner());
-            if slot.is_some() {
+            // Проверка, сборка, запуск и установка — под `engine_serial`:
+            // кроме нас, класть в ячейку может только `refresh_engine`, а
+            // он берёт тот же замок, так что пустая ячейка пустой и
+            // останется. Поэтому сам замок ячейки на время сборки и запуска
+            // не держится: на нём висит обработчик запуска процессов.
+            let _serial = shared.engine_serial.lock().unwrap_or_else(|e| e.into_inner());
+            if shared.engine.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
                 return Err("путь B уже работает — по списку правил или другим опытом".to_owned());
             }
+            let engine = crate::redirect::Engine::new(
+                shared.store.clone(),
+                crate::redirect::Watch::Needle(target.to_lowercase()),
+                // Опыт окну не докладывает и запретов не заводит: его цель —
+                // не правило из списка.
+                None,
+                None,
+            );
             engine.start()?;
-            *slot = Some(EngineSlot { engine, from_policy: false });
+            *shared.engine.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(EngineSlot { engine, from_policy: false });
         }
+        // Свои секунды опыт спит без замков: правки списка в это время
+        // проходят (и откладывают путь B до конца опыта).
         std::thread::sleep(std::time::Duration::from_secs(seconds as u64));
-        let slot = shared.engine.lock().unwrap_or_else(|e| e.into_inner()).take();
-        let line = match slot {
-            Some(slot) => crate::redirect::describe(&slot.engine.stop()),
-            // Движок унесли из-под нас — такого быть не должно, но
-            // придумывать итог нельзя.
-            None => "итог неизвестен: движок остановлен не нами".to_owned(),
+        let line = {
+            let _serial = shared.engine_serial.lock().unwrap_or_else(|e| e.into_inner());
+            // Забрать из ячейки и только потом останавливать: остановка
+            // ждёт рабочие потоки, а они спрашивают ячейку.
+            // Движок списка опыт не трогает: остановить его значило бы снять
+            // перехват по списку.
+            let slot = {
+                let mut cell = shared.engine.lock().unwrap_or_else(|e| e.into_inner());
+                if cell.as_ref().is_some_and(|slot| !slot.from_policy) {
+                    cell.take()
+                } else {
+                    None
+                }
+            };
+            match slot {
+                Some(slot) => crate::redirect::describe(&slot.engine.stop()),
+                // Движок унесли из-под нас — такого быть не должно, но
+                // придумывать итог нельзя.
+                None => "итог неизвестен: движок остановлен не нами".to_owned(),
+            }
         };
         shared.store.log(&format!("путь B: опыт закончен. {line}"));
         // Список мог измениться, пока шёл опыт.
-        Shared::refresh_engine(shared, "после опыта", &[]);
+        Shared::refresh_engine(shared, "после опыта");
         Ok(line)
     }
 
@@ -1208,15 +1383,34 @@ impl Shared {
             }
         };
 
-        let shared = shared.clone();
-        let _ = std::thread::Builder::new()
-            .name("hooked?".into())
-            .spawn(move || {
-                let Some(hooked) = procs::hooked(pid) else {
-                    return; // Процесс кончился, не дождавшись ответа.
-                };
-                shared.remember(pid, Running { target, image, hooked });
-            });
+        // Время создания — сейчас, пока процесс точно жив: по нему потом
+        // видно, тот ли это процесс или номер уже у другого.
+        let created = vpnsplit_net::proc::created(pid);
+
+        Shared::await_hooks(shared, pid, Running { target, image, hooked: false, created });
+    }
+
+    /// Ждёт в отдельном потоке «hooked?», встанут ли хуки в процессе, и
+    /// записывает ответ. `hooked` в `running` не читается.
+    fn await_hooks(shared: &Arc<Shared>, pid: u32, running: Running) {
+        /// Снимает отметку «ждём» и при панике потока: иначе пересмотр
+        /// списка больше никогда не заводил бы ожидание на этот номер.
+        struct Waiting(Arc<Shared>, u32);
+        impl Drop for Waiting {
+            fn drop(&mut self) {
+                self.0.state.lock().unwrap_or_else(|e| e.into_inner()).processes.wait_ends(self.1);
+            }
+        }
+        shared.state.lock().unwrap_or_else(|e| e.into_inner()).processes.wait_begins(pid);
+        let waiting = Waiting(shared.clone(), pid);
+        // Поток не завёлся — замыкание со стражем уничтожается, и отметка
+        // снимается его Drop.
+        let _ = std::thread::Builder::new().name("hooked?".into()).spawn(move || {
+            let Some(hooked) = procs::hooked(pid) else {
+                return; // Процесс кончился, не дождавшись ответа.
+            };
+            waiting.0.remember(pid, Running { hooked, ..running });
+        });
     }
 
     fn remember(&self, pid: u32, running: Running) {
@@ -1227,18 +1421,68 @@ impl Shared {
         };
         let name = running.target.display_name();
         let hooked = running.hooked;
-        {
+        let created = running.created;
+        let (replaced, upgraded) = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.processes.contains(pid) {
+            // Reused — номер у нового процесса, а о завершении прежнего
+            // события не было. Hooked — «мимо туннеля» было сказано раньше,
+            // чем закончился init: окно этот процесс уже знает, и
+            // ProcessAttached ниже заменит у него запись.
+            let change = procs::change(state.processes.get(pid), created, hooked);
+            if change == procs::Change::Same {
                 return;
             }
             state.processes.insert(pid, running);
+            (change == procs::Change::Reused, change == procs::Change::Hooked)
+        };
+        // Процесс мог завершиться, пока ждали его хуков: событие о его
+        // завершении тогда уже обработано, и запись осталась бы навсегда.
+        // Проверка после записи, а не до: завершение, обработанное позже,
+        // снимет запись само. Именно «работает», а не «открывается»:
+        // вышедший процесс открывается, пока его ручку держит родитель, а
+        // короткоживущего помощника родитель держит почти всегда.
+        let running = vpnsplit_net::proc::running_since(pid);
+        let alive = match created {
+            Some(created) => running == Some(created),
+            None => running.is_some(),
+        };
+        if !alive {
+            self.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .processes
+                .remove_if_created(pid, created);
+            // Прежнюю запись окно уже видело — ему надо сказать, что её нет.
+            if replaced || upgraded {
+                self.broadcast(Event::ProcessGone { pid });
+            }
+            return;
+        }
+        // Объявляется под замком состояния и только если запись всё ещё та,
+        // что внесена здесь. Обход и ожидание хуков могут запоминать один
+        // процесс разом: решают и вносят они под замком, а объявляли бы
+        // после него, и «мимо туннеля», ушедшее последним, перекрыло бы в
+        // окне «через туннель», которое уже в таблице. Заменивший запись
+        // объявит её сам, и позже. Замок подписчиков под замком состояния
+        // брать можно: наоборот их не берёт никто.
+        let announced = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let ours = state.processes.holds(pid, created, hooked);
+            if ours {
+                if replaced {
+                    self.broadcast(Event::ProcessGone { pid });
+                }
+                self.broadcast(event);
+            }
+            ours
+        };
+        if !announced {
+            return;
         }
         self.store.log(&format!(
             "процесс {name} ({pid}): {}",
             if hooked { "через туннель" } else { "МИМО туннеля — запущен не лончером" }
         ));
-        self.broadcast(event);
     }
 
     fn process_stopped(&self, pid: u32) {
@@ -1255,14 +1499,14 @@ impl Shared {
     /// Пересмотреть, что из списка работает прямо сейчас. Нужно при старте
     /// службы и после правки списка: приложение могло быть запущено раньше,
     /// чем попало в список, и тогда события о нём уже не придёт.
-    fn rescan(&self, why: &str) {
+    fn rescan(self: &Arc<Self>, why: &str) {
         let (policy, tracked) = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             (state.policy.clone(), state.processes.tracked())
         };
 
-        let found = procs::scan(&policy);
-        let alive: Vec<u32> = found.iter().map(|(pid, _)| *pid).collect();
+        let procs::Scan { found, pending } = procs::scan(&policy);
+        let alive: Vec<u32> = found.iter().chain(&pending).map(|(pid, _)| *pid).collect();
         // Опрос «жив ли процесс» идёт вне замка: это обращение к ядру,
         // и держать на нём общее состояние незачем.
         let dropped = procs::stale(&tracked, &alive, &policy, |pid| {
@@ -1282,6 +1526,22 @@ impl Shared {
         for (pid, running) in found {
             self.remember(pid, running);
         }
+        // init hook.dll ещё идёт: ответ даст ожидание. Если процесс уже ждут
+        // (поток из `process_started`) или о нём уже записано «через
+        // туннель», второе ожидание ничего нового не скажет. А записанное
+        // «мимо» могло быть ответом ожидания, истёкшего раньше, чем DLL
+        // показалась в процессе: его ожидание ещё может исправить (`true` —
+        // «Same» только при записи «через туннель»).
+        for (pid, running) in pending {
+            let known = {
+                let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                state.processes.waiting(pid)
+                    || procs::change(state.processes.get(pid), running.created, true) == procs::Change::Same
+            };
+            if !known {
+                Shared::await_hooks(self, pid, running);
+            }
+        }
 
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.processes.attached() + state.processes.unhooked() > 0 {
@@ -1294,8 +1554,141 @@ impl Shared {
     }
 }
 
+/// Сколько соединений одного пользователя служба обслуживает одновременно.
+/// Окно держит одну подписку и изредка спрашивает ещё; лончер и консоль —
+/// по соединению на запрос. Предел — на пользователя, а не общий: иначе
+/// любой вошедший пользователь, открыв и бросив соединения, отрезал бы от
+/// службы окно и лончер всех остальных. Повышенные клиенты того же
+/// пользователя считаются отдельно (см. `SeatKey`).
+const PER_USER: usize = 16;
+
+/// Всего опознанных соединений — запас от ошибки в счёте, а не рабочий
+/// предел: пользователей на машине куда меньше, чем `MAX_CLIENTS / PER_USER`.
+const MAX_CLIENTS: usize = 256;
+
+/// Сколько соединений одновременно ждут первого запроса. Чьё соединение,
+/// до первого запроса не узнать (Windows не даёт примерить личность
+/// клиента, пока от него ничего не прочитано), поэтому квоты тут нет.
+/// Вместо отказа новое соединение вытесняет самое старое из ждущих, причём
+/// сперва из тех, от кого не пришло ни байта: наплыв молчащих соединений
+/// вытесняет сам себя, а не клиента, который передаёт длинную политику.
+///
+/// Вытесненного не обрывают, а торопят (`Remote::hurry`): запрос, который
+/// уже лежит в канале, он дочитает и обслужит, а ждать остального не
+/// станет. Так не теряется свой клиент, чей поток просто не успел дойти до
+/// чтения. Что остаётся: наплыв соединений, которые шлют по байту без
+/// перевода строки, вытеснит и длинный запрос, если тот передаётся дольше,
+/// чем наплыв обновляет очередь.
+const MAX_WAITING: usize = 32;
+
+/// Срок первого запроса. Свой клиент шлёт его сразу; самый длинный —
+/// политика с конфигом VPN — это десятки килобайт по локальному каналу.
+const FIRST_REQUEST: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Сколько событий ждут подписчика, который не успевает их читать.
+const SUBSCRIBER_QUEUE: usize = 256;
+
+/// Как часто подписка без событий проверяет, не закрыл ли окно свой конец.
+/// Без этого закрытое окно держало бы место своего пользователя до
+/// следующего события, а на тихой машине его может не быть часами.
+const SUBSCRIBER_PROBE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Чьё соединение для счёта мест: SID пользователя (`None` — не узнали) и
+/// повышен ли клиент. Повышенные — отдельный запас: необычные программы
+/// того же пользователя не займут место окна администратора.
+type SeatKey = (Option<String>, bool);
+
+/// Места клиентов канала. `R` — чем вытеснять ждущего (в службе —
+/// `stall::Remote`; в тестах — что угодно).
+struct Seats<R> {
+    /// Ждущие первого запроса, старые впереди, и пришло ли от них хоть что-то.
+    waiting: VecDeque<(u64, R, Arc<AtomicBool>)>,
+    next: u64,
+    users: HashMap<SeatKey, usize>,
+    total: usize,
+    /// О вытеснениях и отказах — одна строка на волну, а не на каждое:
+    /// иначе тот же наплыв соединений раздувал бы журнал.
+    crowded: bool,
+    refusing: bool,
+}
+
+impl<R> Seats<R> {
+    fn new() -> Self {
+        Seats {
+            waiting: VecDeque::new(),
+            next: 0,
+            users: HashMap::new(),
+            total: 0,
+            crowded: false,
+            refusing: false,
+        }
+    }
+
+    /// Новое соединение ждёт первого запроса: его номер и тот, кого оно
+    /// вытеснило: самое старое из молчащих, а если молчащих нет — самое
+    /// старое вообще.
+    fn wait(&mut self, remote: R, heard: Arc<AtomicBool>) -> (u64, Option<R>) {
+        let evicted = if self.waiting.len() >= MAX_WAITING {
+            let at = self.waiting.iter().position(|(_, _, heard)| !heard.load(Ordering::Relaxed)).unwrap_or(0);
+            self.waiting.remove(at).map(|(_, remote, _)| remote)
+        } else {
+            None
+        };
+        let id = self.next;
+        self.next += 1;
+        self.waiting.push_back((id, remote, heard));
+        (id, evicted)
+    }
+
+    /// Ожидание кончилось: запрос пришёл, срок вышел или поток ушёл.
+    fn served(&mut self, id: u64) {
+        self.waiting.retain(|(waiting, _, _)| *waiting != id);
+    }
+
+    /// Занять место пользователя; `false` — его места кончились.
+    fn take(&mut self, key: &SeatKey) -> bool {
+        if self.users.get(key).copied().unwrap_or(0) >= PER_USER || self.total >= MAX_CLIENTS {
+            return false;
+        }
+        *self.users.entry(key.clone()).or_insert(0) += 1;
+        self.total += 1;
+        true
+    }
+
+    fn leave(&mut self, key: &SeatKey) {
+        if let Some(count) = self.users.get_mut(key) {
+            *count -= 1;
+            if *count == 0 {
+                self.users.remove(key);
+            }
+            self.total = self.total.saturating_sub(1);
+        }
+    }
+}
+
+type SharedSeats = Arc<Mutex<Seats<Remote>>>;
+
+/// Соединение среди ждущих первого запроса; уходит оттуда вместе с этим.
+struct Waiting(SharedSeats, u64);
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).served(self.1);
+    }
+}
+
+/// Занятое место пользователя; освобождается, когда поток клиента кончается.
+struct Seat(SharedSeats, SeatKey);
+
+impl Drop for Seat {
+    fn drop(&mut self) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).leave(&self.1);
+    }
+}
+
 fn serve(server: Server, first: Instance, shared: Arc<Shared>) {
     let mut next = Some(first);
+    let seats: SharedSeats = Arc::new(Mutex::new(Seats::new()));
     loop {
         let waiting = next.take().map(Instance::wait);
         let connection = match waiting {
@@ -1314,21 +1707,109 @@ fn serve(server: Server, first: Instance, shared: Arc<Shared>) {
             },
         };
         let shared = shared.clone();
-        let _ = std::thread::Builder::new()
-            .name("client".into())
-            .spawn(move || handle(connection, shared));
+        let seats = seats.clone();
+        let _ = std::thread::Builder::new().name("client".into()).spawn(move || client(connection, shared, seats));
     }
 }
 
-fn handle(mut connection: Connection, shared: Arc<Shared>) {
-    loop {
-        let request = match connection.receive::<Request>() {
-            Ok(Some(request)) => request,
-            Ok(None) => return,
-            Err(e) => {
-                let _ = connection.send(&Response::Error(format!("непонятный запрос: {e}")));
-                return;
+/// Отказ «мест нет». Ответ ложится в пустой буфер канала (служба ещё ничего
+/// не писала), и клиент, который не читает, поток не задержит.
+fn refuse_busy(connection: &mut Connection) {
+    let _ = connection.send(&Response::Error(
+        "служба занята: открыто слишком много соединений. Попробуй ещё раз позже".to_owned(),
+    ));
+}
+
+/// Поток одного клиента: первый запрос — в срок, место — из квоты его
+/// пользователя, дальше обычный разговор.
+fn client(mut connection: Connection, shared: Arc<Shared>, seats: SharedSeats) {
+    let watch = match Watch::this_thread() {
+        Ok(watch) => watch,
+        Err(e) => {
+            shared.store.log(&format!("канал: не удалось поставить сторожа на соединение: {e}"));
+            refuse_busy(&mut connection);
+            return;
+        }
+    };
+    let heard = Arc::new(AtomicBool::new(false));
+    let waiting = {
+        let mut places = seats.lock().unwrap_or_else(|e| e.into_inner());
+        let (id, evicted) = places.wait(watch.remote(), heard.clone());
+        match evicted {
+            Some(evicted) => {
+                evicted.hurry();
+                if !places.crowded {
+                    places.crowded = true;
+                    shared.store.log(&format!(
+                        "канал: первого запроса ждут {MAX_WAITING} соединений, самые старые больше не ждут"
+                    ));
+                }
             }
+            None => places.crowded = false,
+        }
+        Waiting(seats.clone(), id)
+    };
+    let first = watch.guard(Some(FIRST_REQUEST), || connection.receive_noting::<Request>(&heard));
+    drop(waiting);
+    // Соединение ушло из очереди ждущих, и торопить его больше некому.
+    // Просьба, пришедшая уже после чтения запроса, не должна задеть
+    // дальнейший разговор — подписку, например.
+    watch.pardon();
+    let first = match first {
+        Ok(Some(request)) => request,
+        Ok(None) => return,
+        // Промолчал до срока или вытеснен: отвечать некому — ответ мог бы
+        // застрять в записи.
+        Err(e) if e.kind() == std::io::ErrorKind::TimedOut => return,
+        Err(e) => {
+            let _ = connection.send(&Response::Error(format!("непонятный запрос: {e}")));
+            return;
+        }
+    };
+
+    let identity = connection.client();
+    let key: SeatKey = (
+        identity.as_ref().and_then(|client| client.sid.clone()),
+        identity.as_ref().is_some_and(|client| client.elevated),
+    );
+    let seat = {
+        let mut places = seats.lock().unwrap_or_else(|e| e.into_inner());
+        if places.take(&key) {
+            places.refusing = false;
+            Some(Seat(seats.clone(), key))
+        } else {
+            if !places.refusing {
+                places.refusing = true;
+                shared.store.log(&format!(
+                    "канал: у клиента {} {} открыто слишком много соединений, новые не принимаются, \
+                     пока не закроются старые",
+                    key.0.as_deref().unwrap_or("(не опознан)"),
+                    if key.1 { "с повышенными правами" } else { "без повышения" },
+                ));
+            }
+            None
+        }
+    };
+    let Some(_seat) = seat else {
+        refuse_busy(&mut connection);
+        return;
+    };
+    handle(connection, shared, &watch, first);
+}
+
+fn handle(mut connection: Connection, shared: Arc<Shared>, watch: &Watch, first: Request) {
+    let mut first = Some(first);
+    loop {
+        let request = match first.take() {
+            Some(request) => request,
+            None => match connection.receive::<Request>() {
+                Ok(Some(request)) => request,
+                Ok(None) => return,
+                Err(e) => {
+                    let _ = connection.send(&Response::Error(format!("непонятный запрос: {e}")));
+                    return;
+                }
+            },
         };
 
         // Проверки и опыты перехватывают чужие пакеты или отрезают
@@ -1355,36 +1836,45 @@ fn handle(mut connection: Connection, shared: Arc<Shared>) {
             Request::GetPolicy => {
                 Response::Policy(shared.state.lock().unwrap_or_else(|e| e.into_inner()).policy.clone())
             }
-            Request::SetPolicy(policy) => match shared.store.save(&policy) {
-                Ok(()) => {
-                    shared.store.log(&format!("политика обновлена: правил {}", policy.rules.len()));
-                    shared.state.lock().unwrap_or_else(|e| e.into_inner()).policy = policy.clone();
-                    // Приложение могли добавить в список уже запущенным —
-                    // события о его старте не будет, а знать о нём надо.
-                    shared.rescan("список изменён");
-                    // И запреты должны знать о новом списке: добавили
-                    // приложение при упавшем туннеле — запрет на него.
-                    shared.refresh_killswitch();
-                    // Запреты на время простоя службы — тоже по списку:
-                    // новому приложению поставить, убранному снять.
-                    Shared::refresh_standing(&shared, "список изменён");
-                    // А путь B поднимается и гаснет ровно по этому списку.
-                    Shared::refresh_engine(&shared, "список изменён", &[]);
-                    // Свои подключения держатся, пока есть для кого, — и
-                    // перехват должен знать, кого в какое вести.
-                    shared.vpn.set_policy(&policy);
-                    shared.refresh_lanes();
-                    // Событие — последним. Подписчик по нему спрашивает
-                    // состояние, и если разослать раньше, он увидит перехват,
-                    // который ещё не поднялся: окно так и показывало
-                    // «перехват не поднят» при работающем перехвате.
-                    shared.broadcast(Event::PolicyChanged(policy));
-                    Response::Ok
+            // Правка списка — целиком под `policy_serial`: от проверки и
+            // записи на диск до последнего следствия. Две правки разом иначе
+            // могли оставить на диске одну политику, а в памяти и в
+            // перехвате другую.
+            Request::SetPolicy(policy) => {
+                let _serial = shared.policy_serial.lock().unwrap_or_else(|e| e.into_inner());
+                match admit_policy(&connection, &shared, &policy).and_then(|()| {
+                    shared.store.save(&policy).map_err(|e| format!("не удалось сохранить политику: {e}"))
+                }) {
+                    Ok(()) => {
+                        shared.store.log(&format!("политика обновлена: правил {}", policy.rules.len()));
+                        shared.state.lock().unwrap_or_else(|e| e.into_inner()).policy = policy.clone();
+                        // Приложение могли добавить в список уже запущенным —
+                        // события о его старте не будет, а знать о нём надо.
+                        shared.rescan("список изменён");
+                        // И запреты должны знать о новом списке: добавили
+                        // приложение при упавшем туннеле — запрет на него.
+                        shared.refresh_killswitch();
+                        // Запреты на время простоя службы — тоже по списку:
+                        // новому приложению поставить, убранному снять.
+                        Shared::refresh_standing(&shared, "список изменён");
+                        // А путь B поднимается и гаснет ровно по этому списку.
+                        Shared::refresh_engine(&shared, "список изменён");
+                        // Свои подключения держатся, пока есть для кого, — и
+                        // перехват должен знать, кого в какое вести.
+                        shared.vpn.set_policy(&policy);
+                        shared.refresh_lanes();
+                        // Событие — последним. Подписчик по нему спрашивает
+                        // состояние, и если разослать раньше, он увидит перехват,
+                        // который ещё не поднялся: окно так и показывало
+                        // «перехват не поднят» при работающем перехвате.
+                        shared.broadcast(Event::PolicyChanged(policy));
+                        Response::Ok
+                    }
+                    Err(e) => Response::Error(e),
                 }
-                Err(e) => Response::Error(format!("не удалось сохранить политику: {e}")),
-            },
+            }
             Request::Subscribe => {
-                subscribe(connection, &shared);
+                subscribe(connection, &shared, watch);
                 return;
             }
             // Текст конфига дальше этой строки не идёт: ни в журнал, ни в
@@ -1536,32 +2026,177 @@ fn handle(mut connection: Connection, shared: Arc<Shared>) {
     }
 }
 
+/// Можно ли принять эту политику от клиента на том конце.
+///
+/// Повышенному клиенту — любую. Обычному — если среди новых и изменённых
+/// правил нет чужих программ (см. `rights`). Личность клиента спрашивается,
+/// только когда есть что проверять: обычное сохранение списка из окна без
+/// новых правил на `.exe` её не требует.
+fn admit_policy(connection: &Connection, shared: &Shared, policy: &Policy) -> Result<(), String> {
+    let current = shared.state.lock().unwrap_or_else(|e| e.into_inner()).policy.clone();
+    let checked = crate::rights::fresh(policy, &current)
+        .any(|rule| matches!(rule.target, vpnsplit_core::AppTarget::Executable(_)));
+    if !checked {
+        return Ok(());
+    }
+    let client = connection.client();
+    if client.as_ref().is_some_and(|client| client.elevated) {
+        return Ok(());
+    }
+    let sid = client.and_then(|client| client.sid);
+    crate::rights::admit(policy, &current, &crate::rights::Places::current(), sid.as_deref()).map_err(|e| {
+        shared.store.log(&format!("политика не принята: {e}"));
+        e
+    })
+}
+
 /// После подписки соединение только пишет. Поток спит в recv до следующего
 /// события; отписка — клиент закрыл канал, и следующая запись не удастся.
-fn subscribe(mut connection: Connection, shared: &Shared) {
-    if connection.send(&Response::Ok).is_err() {
+/// Без событий поток изредка смотрит, жив ли канал (`SUBSCRIBER_PROBE`).
+///
+/// Записи — под сторожем: подписчика, который не читает, `broadcast`
+/// выкидывает и просит сторожа прервать запись, на которой поток завис.
+fn subscribe(mut connection: Connection, shared: &Shared, watch: &Watch) {
+    if watch.guard(None, || connection.send(&Response::Ok)).is_err() {
         return;
     }
-    let (tx, rx) = channel();
     // Первыми событиями — текущее состояние, чтобы подписчик начал не
     // вслепую: туннель, а за ним всё, что из списка уже работает. Подписчик
     // может открыться позже службы и иначе не узнал бы об этом никогда.
-    {
+    //
+    // Очередь ограничена: подписчик, который не читает, при переполнении
+    // выпадает (см. `broadcast`). Место под начальные события — сверх
+    // обычного запаса: их число известно здесь же.
+    let (tx, rx) = {
         let state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = tx.send(Event::TunnelChanged(state.tunnel.clone()));
-        for (pid, running) in state.processes.iter() {
-            let _ = tx.send(if running.hooked {
-                Event::ProcessAttached { pid, target: running.target.clone() }
-            } else {
-                Event::ProcessUnhooked { pid, image: running.image.clone() }
-            });
+        let initial: Vec<Event> = std::iter::once(Event::TunnelChanged(state.tunnel.clone()))
+            .chain(state.processes.iter().map(|(pid, running)| {
+                if running.hooked {
+                    Event::ProcessAttached { pid, target: running.target.clone() }
+                } else {
+                    Event::ProcessUnhooked { pid, image: running.image.clone() }
+                }
+            }))
+            .collect();
+        let (tx, rx) = sync_channel(SUBSCRIBER_QUEUE + initial.len());
+        for event in initial {
+            let _ = tx.try_send(event);
+        }
+        (tx, rx)
+    };
+    shared.subscribers.lock().unwrap_or_else(|e| e.into_inner()).push((tx, watch.remote()));
+
+    loop {
+        match rx.recv_timeout(SUBSCRIBER_PROBE) {
+            Ok(event) => {
+                if watch.guard(None, || connection.send(&event)).is_err() {
+                    return;
+                }
+            }
+            // Окно ушло молча — место его пользователя освобождается сейчас,
+            // а не при следующем событии. Его отправитель выпадет из
+            // `subscribers` при следующей рассылке.
+            Err(RecvTimeoutError::Timeout) => {
+                if connection.peer_gone() {
+                    return;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => return,
         }
     }
-    shared.subscribers.lock().unwrap_or_else(|e| e.into_inner()).push(tx);
+}
 
-    for event in rx {
-        if connection.send(&event).is_err() {
-            return;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn user(sid: &str, elevated: bool) -> SeatKey {
+        (Some(sid.to_owned()), elevated)
+    }
+
+    #[test]
+    fn one_user_cannot_take_the_seats_of_another() {
+        let mut seats = Seats::<()>::new();
+        let greedy = user("S-1-5-21-1-2-3-1002", false);
+        for _ in 0..PER_USER {
+            assert!(seats.take(&greedy));
         }
+        assert!(!seats.take(&greedy));
+        // Другой пользователь и повышенный клиент того же — своим запасом.
+        assert!(seats.take(&user("S-1-5-21-1-2-3-1001", false)));
+        assert!(seats.take(&user("S-1-5-21-1-2-3-1002", true)));
+        assert!(seats.take(&(None, false)));
+        // Освободил место — снова можно.
+        seats.leave(&greedy);
+        assert!(seats.take(&greedy));
+        assert!(!seats.take(&greedy));
+    }
+
+    #[test]
+    fn leaving_frees_the_count_completely() {
+        let mut seats = Seats::<()>::new();
+        let key = user("S-1-5-18", true);
+        assert!(seats.take(&key));
+        seats.leave(&key);
+        assert!(seats.users.is_empty());
+        assert_eq!(seats.total, 0);
+        // Лишний уход ничего не ломает.
+        seats.leave(&key);
+        assert_eq!(seats.total, 0);
+    }
+
+    #[test]
+    fn the_total_limit_holds_across_users() {
+        let mut seats = Seats::<()>::new();
+        let mut taken = 0;
+        for n in 0.. {
+            let key = user(&format!("S-1-5-21-1-2-3-{n}"), false);
+            if !(0..PER_USER).all(|_| seats.take(&key)) {
+                break;
+            }
+            taken += PER_USER;
+        }
+        assert_eq!(taken, MAX_CLIENTS);
+        assert_eq!(seats.total, MAX_CLIENTS);
+    }
+
+    #[test]
+    fn a_new_connection_pushes_out_the_oldest_waiting_one() {
+        let mut seats = Seats::<usize>::new();
+        let silent = || Arc::new(AtomicBool::new(false));
+        let ids: Vec<u64> = (0..MAX_WAITING).map(|n| {
+            let (id, evicted) = seats.wait(n, silent());
+            assert_eq!(evicted, None);
+            id
+        }).collect();
+        let (_, evicted) = seats.wait(MAX_WAITING, silent());
+        assert_eq!(evicted, Some(0));
+        // Дождавшийся запроса из очереди уходит, и место есть снова.
+        seats.served(ids[1]);
+        assert_eq!(seats.wait(MAX_WAITING + 1, silent()).1, None);
+        assert_eq!(seats.wait(MAX_WAITING + 2, silent()).1, Some(2));
+        assert_eq!(seats.waiting.len(), MAX_WAITING);
+    }
+
+    #[test]
+    fn a_connection_that_is_sending_outlives_silent_ones() {
+        let mut seats = Seats::<usize>::new();
+        let sending = Arc::new(AtomicBool::new(false));
+        seats.wait(0, sending.clone());
+        for n in 1..MAX_WAITING {
+            seats.wait(n, Arc::new(AtomicBool::new(false)));
+        }
+        // Пошли байты длинного запроса: вытесняются молчащие, что за ним.
+        sending.store(true, Ordering::Relaxed);
+        for n in 0..MAX_WAITING * 2 {
+            let (_, evicted) = seats.wait(MAX_WAITING + n, Arc::new(AtomicBool::new(false)));
+            assert!(evicted.is_some_and(|evicted| evicted != 0), "{evicted:?}");
+        }
+        // Молчащих нет совсем — уходит самый старый, хоть он и говорит.
+        let mut seats = Seats::<usize>::new();
+        for n in 0..MAX_WAITING {
+            seats.wait(n, Arc::new(AtomicBool::new(true)));
+        }
+        assert_eq!(seats.wait(MAX_WAITING, Arc::new(AtomicBool::new(true))).1, Some(0));
     }
 }

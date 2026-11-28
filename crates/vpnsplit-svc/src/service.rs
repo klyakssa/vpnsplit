@@ -17,6 +17,10 @@ use windows_service::{define_windows_service, service_dispatcher};
 const DISPLAY_NAME: &str = "vpnsplit — раздельное туннелирование";
 const DESCRIPTION: &str = "Направляет выбранные приложения через VPN, остальной трафик идёт напрямую.";
 
+/// Сколько `uninstall` ждёт остановки службы: с запасом сверх тех 20 с,
+/// что она сама просит на остановку (столько же ждёт и установщик).
+const STOP_PATIENCE: Duration = Duration::from_secs(45);
+
 define_windows_service!(ffi_service_main, service_main);
 
 /// Точка входа, когда процесс запустил диспетчер служб.
@@ -167,19 +171,33 @@ pub fn uninstall() -> Result<(), String> {
     let service = manager
         .open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE)
         .map_err(|e| admin_hint(format!("служба не найдена или нет прав: {e}")))?;
+    // Ждём настоящей остановки: служба на остановке опускает своё
+    // подключение по-хорошему и просит на это до 20 с. Снять запреты под
+    // ещё живой службой — значит дать ей поставить их заново, а удалённая
+    // она их уже не снимет.
+    let mut stopped = true;
     if let Ok(status) = service.query_status() {
         if status.current_state != ServiceState::Stopped {
             let _ = service.stop();
-            for _ in 0..50 {
-                std::thread::sleep(Duration::from_millis(100));
+            let deadline = std::time::Instant::now() + STOP_PATIENCE;
+            stopped = loop {
                 match service.query_status() {
-                    Ok(s) if s.current_state == ServiceState::Stopped => break,
-                    _ => {}
+                    Ok(s) if s.current_state == ServiceState::Stopped => break true,
+                    _ if std::time::Instant::now() >= deadline => break false,
+                    _ => std::thread::sleep(Duration::from_millis(200)),
                 }
-            }
+            };
         }
     }
     service.delete().map_err(|e| format!("не удалось удалить службу: {e}"))?;
+    if !stopped {
+        println!(
+            "ВНИМАНИЕ: служба не остановилась за {} с; Windows удалит её, когда она остановится.\n  \
+             Если после этого у приложений из списка не будет интернета — выполни\n  \
+             vpnsplit-svc unblock из окна администратора.",
+            STOP_PATIENCE.as_secs()
+        );
+    }
     println!("служба «{SERVICE_NAME}» удалена. Данные в %ProgramData%\\vpnsplit оставлены.");
     // Постоянные запреты службу переживают — в этом их смысл. Но удалённая
     // служба уже не вернётся и не перекроет их своими разрешениями, так

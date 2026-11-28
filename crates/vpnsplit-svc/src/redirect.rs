@@ -237,6 +237,21 @@ impl Asked {
 
     fn went_home(&mut self, name: &str, now: Instant) {
         self.sent_home.insert(dns_key(name), now);
+        // Чистится и здесь, а не только в `note`: «домой» уходят и имена
+        // посторонних программ со своим разрешателем, о которых событий
+        // нет вовсе, и `names` может не дорасти до чистки никогда.
+        if self.sent_home.len() > 512 {
+            self.sent_home.retain(|_, at| now.duration_since(*at) < DNS_ASKED);
+        }
+    }
+
+    /// Чистка по таймеру: всё, что старше срока, уже ни на что не влияет.
+    fn tidy(&mut self, now: Instant) {
+        self.names.retain(|_, askers| {
+            askers.retain(|(_, at)| now.duration_since(*at) < DNS_ASKED);
+            !askers.is_empty()
+        });
+        self.sent_home.retain(|_, at| now.duration_since(*at) < DNS_ASKED);
     }
 }
 
@@ -454,6 +469,11 @@ impl Place {
     }
 }
 
+/// Таблицу ядра прочитать не удалось: хозяин пакета неизвестен. Отдельный
+/// тип, а не `None`, — чтобы «не прочитали» нельзя было принять за «ничей».
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TableUnread;
+
 #[derive(Default)]
 pub struct Stats {
     pub decided: usize,
@@ -542,6 +562,10 @@ pub struct Stats {
     /// Начал соединений, хозяин которых нашёлся только со второй попытки:
     /// сокет ещё не успел появиться в таблице.
     pub syn_owner_late: usize,
+    /// Сколько раз таблицу соединений или сокетов ядра не удалось прочитать
+    /// вовсе. Хозяин пакета тогда неизвестен — это не «ничей», — и пакет
+    /// выбрасывается: приложение повторит, а своё домой не уйдёт.
+    pub table_unread: usize,
     /// Начал соединений от процессов под присмотром, ушедших не с
     /// домашнего адреса. Их мы не трогаем: подменять нечего.
     pub ours_other_source: usize,
@@ -701,9 +725,26 @@ pub struct Engine {
     lanes: Mutex<Lanes>,
     inner: Mutex<Inner>,
     dynamic: Mutex<Option<Arc<divert::Handle>>>,
+    /// Заменённые динамические ручки, чьи очереди ещё не дочитаны. Поток
+    /// пакетов держит только ту, что читает сейчас; при двух перестройках
+    /// подряд промежуточную ручку иначе не держал бы никто, и пакеты из её
+    /// очереди пропадали бы вместе с ней.
+    dynamic_retired: Mutex<std::collections::VecDeque<Arc<divert::Handle>>>,
     /// Текст фильтра, с которым открыта динамическая ручка. Нужен, чтобы
     /// не переоткрывать её без нужды: см. `rebuild`.
     dynamic_filter: Mutex<Option<String>>,
+    /// Перестройка динамической ручки — по одной за раз, от сборки фильтра
+    /// до установки ручки в слот (см. `rebuild`). Её зовут несколько
+    /// потоков: начало соединения, закрытие потока, завершение процесса,
+    /// смена сети. Без этого замка ручка, открытая последней, побеждала,
+    /// даже если её фильтр собран по более старой таблице, и только что
+    /// уведённое соединение выпадало из перехвата.
+    ///
+    /// Берётся первым из замков движка; держащий его не ждёт ни рабочих
+    /// потоков, ни службы — только открытие ручки.
+    rebuild_serial: Mutex<()>,
+    /// То же для ручки ответов UDP (см. `refresh_udp_in`).
+    udp_in_serial: Mutex<()>,
     /// Местные порты UDP: чьи они и наши ли. Пишут сюда двое — поток
     /// событий сокетов (кто занял порт) и поток пакетов (наш ли он).
     udp_ports: Mutex<std::collections::HashMap<u16, UdpPort>>,
@@ -711,6 +752,9 @@ pub struct Engine {
     /// поэтому она переоткрывается, когда адрес меняется, и её нет вовсе,
     /// пока нет туннеля.
     udp_in: Mutex<Option<Arc<divert::Handle>>>,
+    /// Заменённые ручки ответов UDP, чьи очереди ещё не дочитаны (см.
+    /// `dynamic_retired`).
+    udp_in_retired: Mutex<std::collections::VecDeque<Arc<divert::Handle>>>,
     /// Открытые ручки и рабочие потоки, пока перехват идёт.
     live: Mutex<Option<Live>>,
     stats: Mutex<Stats>,
@@ -745,6 +789,20 @@ pub struct Engine {
     /// процесса здесь нет — события о нём ещё в пути, и их надо дождаться.
     settled: Mutex<std::collections::HashSet<u32>>,
     settled_changed: Condvar,
+    /// Номера, чьё завершение обработано недавно, и когда. Пока номер
+    /// здесь, решения о нём не запоминаются (`settled`, `name_verdicts`)
+    /// и по снимку он в родословную не принимается: событие о завершении
+    /// уже было, и стереть запись, сделанную после него, было бы некому, —
+    /// она досталась бы новому хозяину номера. Номер уходит отсюда с
+    /// событием о запуске нового хозяина или по сроку (`STOPPED_MEMORY`).
+    ///
+    /// Замок берётся только сам по себе или после `inner`, `settled` и
+    /// `name_verdicts`, никогда — перед ними.
+    stopped_recently: Mutex<std::collections::HashMap<u32, Instant>>,
+    /// Кого чистка не нашла в прошлом снимке (см. `flows::Absence`).
+    /// Замок берётся только сам по себе или после `settled`, никогда —
+    /// перед другими.
+    absence: Mutex<flows::Absence>,
     /// Кому сообщать, под какими правилами сейчас кто-то есть. У движка
     /// опыта слушателя нет: его цель — подстрока, а не правило из списка.
     listener: Option<Listener>,
@@ -804,6 +862,48 @@ const OTHER_SOURCE_CHECKS: usize = 400;
 /// открывает десятки соединений, не сотни.
 const PASSED_MEMORY: usize = 256;
 
+/// Сколько помнить номер завершившегося процесса (`stopped_recently`).
+/// Дольше, чем живут заказчики имён (`DNS_ASKED`): по ним о процессе
+/// спрашивают и после его смерти.
+const STOPPED_MEMORY: Duration = Duration::from_secs(30);
+
+/// Как часто чистить устаревшее: умерших членов родословной, о чьём
+/// завершении событие потерялось, потоки без события закрытия и прочие
+/// записи о мёртвых номерах.
+const TIDY_EVERY: Duration = Duration::from_secs(30);
+
+/// Поток моложе этого чистка не трогает, даже если в таблице соединений
+/// ядра его не видно.
+const FLOW_GRACE: Duration = Duration::from_secs(30);
+
+/// Сколько заменённых ручек ждут, пока их дочитают. Больше бывает, только
+/// если перестройки идут быстрее, чем поток пакетов успевает читать, — тогда
+/// старейшая закрывается, как и раньше.
+const RETIRED_MAX: usize = 16;
+
+/// Отложить заменённую ручку: новых пакетов она больше не принимает, а те,
+/// что уже в её очереди, дочитает поток пакетов (см. [`next_handle`]).
+fn retire(retired: &Mutex<std::collections::VecDeque<Arc<divert::Handle>>>, old: Arc<divert::Handle>) {
+    old.stop();
+    let mut retired = retired.lock().unwrap_or_else(|e| e.into_inner());
+    retired.push_back(old);
+    while retired.len() > RETIRED_MAX {
+        retired.pop_front();
+    }
+}
+
+/// Какую ручку читать дальше: сначала заменённые, по порядку замены, — их
+/// очереди надо дочитать и вернуть в сеть, — потом нынешнюю.
+fn next_handle(
+    retired: &Mutex<std::collections::VecDeque<Arc<divert::Handle>>>,
+    slot: &Mutex<Option<Arc<divert::Handle>>>,
+) -> Option<Arc<divert::Handle>> {
+    if let Some(old) = retired.lock().unwrap_or_else(|e| e.into_inner()).pop_front() {
+        return Some(old);
+    }
+    slot.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// Живой перехват: открытые ручки и потоки, которые их качают.
 ///
 /// Держать это в самом движке, а не в вызывающем потоке, нужно затем, что
@@ -846,9 +946,13 @@ impl Engine {
                 family: flows::Family::default(),
             }),
             dynamic: Mutex::new(None),
+            dynamic_retired: Mutex::new(std::collections::VecDeque::new()),
             dynamic_filter: Mutex::new(None),
+            rebuild_serial: Mutex::new(()),
+            udp_in_serial: Mutex::new(()),
             udp_ports: Mutex::new(std::collections::HashMap::new()),
             udp_in: Mutex::new(None),
+            udp_in_retired: Mutex::new(std::collections::VecDeque::new()),
             live: Mutex::new(None),
             stats: Mutex::new(Stats::default()),
             stop: AtomicBool::new(false),
@@ -859,6 +963,8 @@ impl Engine {
             // ждать их незачем.
             settled: Mutex::new(proc::parents().into_iter().map(|(pid, _, _)| pid).collect()),
             settled_changed: Condvar::new(),
+            stopped_recently: Mutex::new(std::collections::HashMap::new()),
+            absence: Mutex::new(flows::Absence::default()),
             listener,
             announced: Mutex::new(Vec::new()),
             learner,
@@ -975,16 +1081,23 @@ impl Engine {
     /// после правки списка в ней могли остаться потоки процессов, которые
     /// больше не наши.
     fn reseed(&self) -> (usize, usize) {
-        let fresh = self.fresh_family();
+        let (mut fresh, taken) = self.fresh_family();
         let rules = self.watch.lock().unwrap_or_else(|e| e.into_inner()).rule_keys();
         let result = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            // Снимок сделан раньше, и кто-то из найденных мог с тех пор
+            // завершиться: событие о его завершении уже обработано, и
+            // принятый сейчас остался бы в родословной навсегда. Проверка
+            // под `inner`: завершение, обработанное позже, снимет его само.
+            self.drop_stopped(&mut fresh, taken);
             // Прежняя родословная не выбрасывается: уходят только те, чьё
             // правило снято. Строить её заново по снимку нельзя — снимок
             // не помнит умерших, и всё, что запущено запускателем из
             // списка, при первой же правке выпало бы из туннеля.
             inner.family.keep_rules(|rule| rules.contains(rule));
-            let came = inner.family.absorb(fresh);
+            // Системный вызов под замком — только при споре о номере, а
+            // это редкость.
+            let came = inner.family.absorb(fresh, proc::created);
             let Inner { table, family } = &mut *inner;
             let dropped = table.forget_unless(|pid| family.contains(pid));
             (family.len(), dropped, came)
@@ -1205,13 +1318,15 @@ impl Engine {
     }
 
     /// Процессы, уже запущенные к этому моменту, и их потомки. Их самих
-    /// иначе не узнать: события запуска мы пропустили.
-    fn fresh_family(&self) -> flows::Family {
+    /// иначе не узнать: события запуска мы пропустили. Второе — когда
+    /// сделан снимок (см. `drop_stopped`).
+    fn fresh_family(&self) -> (flows::Family, Instant) {
+        let taken = Instant::now();
         let snapshot = proc::parents();
         let mut family = flows::Family::default();
         for (pid, parent, _) in &snapshot {
             if let Some(rule) = self.rule_for(*pid) {
-                family.started(*pid, *parent, Some(&rule));
+                family.started_at(*pid, *parent, Some(&rule), proc::created(*pid));
             }
         }
         // Снимок для родословной годится именно здесь: родители живы,
@@ -1220,7 +1335,7 @@ impl Engine {
         // создания внутри `grow`.
         let pairs: Vec<(u32, u32)> = snapshot.iter().map(|(pid, parent, _)| (*pid, *parent)).collect();
         family.grow(&pairs, proc::created);
-        family
+        (family, taken)
     }
 
     /// Кто под присмотром прямо сейчас — чтобы записать перед остановкой
@@ -1340,7 +1455,17 @@ impl Engine {
             .name("pathb-check".into())
             .spawn(move || {
                 std::thread::sleep(Duration::from_secs(seconds as u64) + Duration::from_millis(200));
-                *engine.pretend.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                {
+                    // Снимается только своя проверка: если за это время
+                    // поставили новую, со своим сроком, её снимет свой
+                    // поток. Иначе короткая проверка, начатая раньше,
+                    // обрывала бы более позднюю и длинную.
+                    let mut pretend = engine.pretend.lock().unwrap_or_else(|e| e.into_inner());
+                    if *pretend != Some(until) {
+                        return;
+                    }
+                    *pretend = None;
+                }
                 let dropped = engine.stats.lock().unwrap_or_else(|e| e.into_inner()).dropped;
                 engine.store.log(&format!(
                     "путь B: ПРОВЕРКА кончилась, {}; выброшено пакетов за всё время {dropped}",
@@ -1422,14 +1547,45 @@ impl Engine {
     /// Чьё это начало соединения с внутренним адресом — если оно из
     /// приложения, чьему VPN сервер эту сеть назначил. Остальным своя сеть
     /// остаётся своей, и считать за ними это соединение незачем.
-    fn inside_owner(&self, key: &flows::Key) -> Option<u32> {
-        let pid = tcptable::owner(key.local_port, key.remote, key.remote_port)?;
+    ///
+    /// `Err` — таблицу соединений не прочитать, и чьё это начало, неизвестно.
+    fn inside_owner(&self, key: &flows::Key) -> Result<Option<u32>, TableUnread> {
+        let Some(pid) = self.tcp_owner(key)? else {
+            return Ok(None);
+        };
         if !self.belongs(pid) {
-            return None;
+            return Ok(None);
         }
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let lanes = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
-        lanes.inside(inner.family.rule_of(pid), key.remote).then_some(pid)
+        Ok(lanes.inside(inner.family.rule_of(pid), key.remote).then_some(pid))
+    }
+
+    /// Хозяин соединения по таблице ядра. Сбой чтения таблицы считается и
+    /// первые попадают в журнал: это не «хозяина нет», и путать их нельзя.
+    fn tcp_owner(&self, key: &flows::Key) -> Result<Option<u32>, TableUnread> {
+        tcptable::owner(key.local_port, key.remote, key.remote_port)
+            .map_err(|e| self.table_unread("соединений TCP", &e))
+    }
+
+    /// Учесть, что таблицу ядра прочитать не удалось.
+    fn table_unread(&self, which: &str, error: &std::io::Error) -> TableUnread {
+        let count = {
+            let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+            stats.table_unread += 1;
+            stats.table_unread
+        };
+        // Первые восемь — подробно, дальше каждая тысячная: пока таблица
+        // не читается, домой не выходит ни одно начало соединения, и
+        // затянувшийся сбой должен быть виден в журнале, а не только в
+        // счётчике.
+        if count <= 8 || count % 1000 == 0 {
+            self.store.log(&format!(
+                "путь B: таблица {which} ядра не прочиталась ({error}) — хозяин неизвестен, \
+                 пакет не выпускаю (всего таких случаев {count})"
+            ));
+        }
+        TableUnread
     }
 
     /// Куда вести имя, спрошенное этим процессом: туннель его правила и
@@ -1468,6 +1624,14 @@ impl Engine {
     /// знание: программа запущена сама по себе, и если её же видели под
     /// правилом, запрет на время простоя с неё надо снять.
     pub fn on_process_started(&self, pid: u32, parent: u32, event_image: Option<&str>) -> bool {
+        // Номер у нового хозяина: всё, что помнилось о прежнем, к нему
+        // отношения не имеет.
+        self.stopped_recently.lock().unwrap_or_else(|e| e.into_inner()).remove(&pid);
+        // Раньше отметки `settled` ниже: чистка решает, что стирать, под
+        // замком `settled`, и номер, отмеченный после этого, не тронет.
+        self.absence.lock().unwrap_or_else(|e| e.into_inner()).started(pid);
+        self.name_verdicts.lock().unwrap_or_else(|e| e.into_inner()).remove(&pid);
+        self.drop_if_reused(pid);
         let adopted = self.adopt_started(pid, parent, event_image);
         // Отметка ставится после решения, а не до: тот, кто ждёт этого
         // события, проснувшись, сразу смотрит в родословную.
@@ -1505,9 +1669,24 @@ impl Engine {
         // открываем процесс и смотрим путь с пакетом. Этот обработчик
         // вызывается на каждый запуск процесса в системе, и лишних
         // системных вызовов здесь быть не должно.
-        let inherited = {
+        let (inherited, parent_born) = {
             let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            inner.family.rule_of(parent).map(str::to_owned)
+            (inner.family.rule_of(parent).map(str::to_owned), inner.family.born(parent))
+        };
+        // Время создания спрашивается только у тех, кого, похоже, примем:
+        // обработчик зовётся на каждый запуск в системе.
+        let mut born = None;
+        let inherited = match inherited {
+            Some(rule) => {
+                born = proc::created(pid);
+                // Ребёнок не бывает старше родителя: если старше, номер
+                // родителя в родословной — уже другого процесса.
+                match (born, parent_born) {
+                    (Some(child), Some(elder)) if child < elder => None,
+                    _ => Some(rule),
+                }
+            }
+            None => None,
         };
         let mut image = None;
         let mut gone = false;
@@ -1517,15 +1696,15 @@ impl Engine {
                 let live = proc::image_path(pid);
                 gone = live.is_none();
                 image = live.or_else(|| event_image.and_then(vpnsplit_net::devpath::to_dos));
-                match self.rule_for_image(pid, image.as_deref()) {
-                    Some(rule) => rule,
-                    None => return None,
-                }
+                self.rule_for_image(pid, image.as_deref())?
             }
         };
+        if born.is_none() && !gone {
+            born = proc::created(pid);
+        }
         let adopted = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            inner.family.started(pid, parent, Some(&rule))
+            inner.family.started_at(pid, parent, Some(&rule), born)
         };
         if !adopted {
             return None;
@@ -1595,9 +1774,30 @@ impl Engine {
                     .0;
                 arrived = settled.contains(&pid);
             }
-            settled.insert(pid);
             arrived
         };
+        if !arrived {
+            // Отметка «ждали, больше не ждём». Но не для процесса, который
+            // уже завершился: событие о его завершении обработано, стереть
+            // отметку будет некому, и новый хозяин номера, соединившись
+            // раньше своего события о запуске, был бы сочтён чужим без
+            // ожидания. Жив ли он, спрашивается вне замка и только если
+            // номер недавно освобождался. «Жив» — значит работает: вышедший
+            // процесс, чью ручку ещё держат, открывается так же.
+            let reborn = self.recently_stopped(pid) && proc::running_since(pid).is_some();
+            let mut settled = self.settled.lock().unwrap_or_else(|e| e.into_inner());
+            // Проверка ещё раз под замком `settled`: завершение отмечается
+            // раньше, чем стирается отметка, поэтому опоздавшее завершение
+            // либо видно здесь, либо сотрёт отметку само.
+            if !self.recently_stopped(pid) {
+                settled.insert(pid);
+            } else if reborn {
+                // Номер уже у нового процесса, а его событие о запуске не
+                // пришло: ждали его один раз, и хватит.
+                self.stopped_recently.lock().unwrap_or_else(|e| e.into_inner()).remove(&pid);
+                settled.insert(pid);
+            }
+        }
         let spent = started.elapsed().as_micros();
         let ours = self.inner.lock().unwrap_or_else(|e| e.into_inner()).family.contains(pid);
         let count = {
@@ -1633,21 +1833,104 @@ impl Engine {
 
     /// Завершение процесса: его потоки больше не нужны в фильтре.
     pub fn on_process_stopped(&self, pid: u32) {
+        // Сначала отметка «завершился», потом стирание решений: кто
+        // запоминает решение, сверяется с отметкой под замком решений, и
+        // запись, сделанная после стирания, так не появится.
+        {
+            let now = Instant::now();
+            let mut stopped = self.stopped_recently.lock().unwrap_or_else(|e| e.into_inner());
+            stopped.insert(pid, now);
+            // События о запуске новых хозяев номеров могут теряться;
+            // расти без предела карте незачем.
+            if stopped.len() > 1024 {
+                stopped.retain(|_, at| now.duration_since(*at) < STOPPED_MEMORY);
+            }
+        }
         // Номер освободился и достанется кому-то другому; о новом хозяине
         // мы ничего не знаем, пока не придёт событие о его запуске.
         self.settled.lock().unwrap_or_else(|e| e.into_inner()).remove(&pid);
         self.name_verdicts.lock().unwrap_or_else(|e| e.into_inner()).remove(&pid);
+        self.release(pid, |family| family.stopped(pid));
         // Счётчики процесса снимаются у всех, не только у своих: иначе
-        // они достались бы следующему хозяину номера.
-        let traffic = self.seen.lock().unwrap_or_else(|e| e.into_inner()).remove(&pid);
+        // они достались бы следующему хозяину номера. У своего их уже
+        // забрал `release`.
+        self.seen.lock().unwrap_or_else(|e| e.into_inner()).remove(&pid);
+    }
+
+    /// Был ли номер освобождён недавно (см. `stopped_recently`).
+    fn recently_stopped(&self, pid: u32) -> bool {
+        self.stopped_recently
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&pid)
+            .is_some_and(|at| at.elapsed() < STOPPED_MEMORY)
+    }
+
+    /// Обработано ли завершение процесса с этим номером не раньше `taken`.
+    ///
+    /// Для тех, кого нашли по снимку, сделанному в `taken`: завершение,
+    /// обработанное до снимка, — о прежнем хозяине номера, а в снимке уже
+    /// новый, живой (вышедших процессов снимок не показывает, даже если их
+    /// ручки кто-то держит). Его отвергать нельзя: номера Windows раздаёт заново
+    /// почти сразу, и это обычный случай для ребёнка, соединившегося раньше
+    /// своего события о запуске.
+    fn stopped_since(&self, pid: u32, taken: Instant) -> bool {
+        self.stopped_recently
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&pid)
+            .is_some_and(|at| *at >= taken)
+    }
+
+    /// Выбрасывает из родословной, найденной по снимку в `taken`, тех, чьё
+    /// завершение обработано после снимка. Зовётся под `inner`.
+    fn drop_stopped(&self, family: &mut flows::Family, taken: Instant) {
+        let gone: Vec<u32> = {
+            let stopped = self.stopped_recently.lock().unwrap_or_else(|e| e.into_inner());
+            family
+                .members()
+                .map(|(pid, _)| pid)
+                .filter(|pid| stopped.get(pid).is_some_and(|at| *at >= taken))
+                .collect()
+        };
+        for pid in gone {
+            family.stopped(pid);
+        }
+    }
+
+    /// Пришло событие о запуске процесса, а номер уже в родословной. Обычно
+    /// это он сам, принятый по родословной раньше своего события. Но если
+    /// время создания не то, что записано, — прежний хозяин номера умер, а
+    /// событие о его завершении потерялось; тогда прежняя запись снимается
+    /// со всем, что к ней относится, и новый процесс судится сам по себе.
+    fn drop_if_reused(&self, pid: u32) {
+        let Some(kept) = self.inner.lock().unwrap_or_else(|e| e.into_inner()).family.born(pid) else {
+            return;
+        };
+        if !proc::created(pid).is_some_and(|now| now != kept) {
+            return;
+        }
+        self.release(pid, |family| family.stopped_if_born(pid, Some(kept)));
+        self.store.log(&format!(
+            "путь B: номер {pid} достался новому процессу, а о завершении прежнего события не было — \
+             прежняя запись снята"
+        ));
+    }
+
+    /// Снимает процесс с присмотра: его потоки, порты UDP и счёт. `remove`
+    /// решает под замком `inner`, снимать ли запись в родословной; не снята
+    /// — не трогается и остальное, счёт тоже: номер может быть уже у нового
+    /// члена, и счёт тогда его.
+    fn release(&self, pid: u32, remove: impl FnOnce(&mut flows::Family) -> bool) {
         let (rule, dropped) = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let rule = inner.family.rule_of(pid).map(str::to_owned);
-            if !inner.family.stopped(pid) {
+            if !remove(&mut inner.family) {
                 return;
             }
             (rule, inner.table.forget_process(pid))
         };
+        let traffic = self.seen.lock().unwrap_or_else(|e| e.into_inner()).remove(&pid);
         if let (Some(rule), Some(traffic)) = (rule, traffic) {
             self.finish(pid, &rule, traffic);
         }
@@ -1664,11 +1947,140 @@ impl Engine {
         }
     }
 
+    /// Поток чистки: раз в `TIDY_EVERY` выбрасывает устаревшее. Спит
+    /// короткими отрезками, чтобы остановка движка его не ждала.
+    fn tidy_loop(&self) {
+        let mut last = Instant::now();
+        while !self.stopping() {
+            std::thread::sleep(Duration::from_millis(200));
+            if last.elapsed() < TIDY_EVERY {
+                continue;
+            }
+            last = Instant::now();
+            self.tidy();
+        }
+    }
+
+    /// Выбрасывает то, что осталось от процессов и потоков, о конце которых
+    /// событие не пришло: события ETW теряются при переполнении буферов, а
+    /// у несостоявшейся попытки соединения события закрытия нет вовсе.
+    fn tidy(&self) {
+        let now = Instant::now();
+        self.asked.lock().unwrap_or_else(|e| e.into_inner()).tidy(now);
+        self.stopped_recently
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, at| now.duration_since(*at) < STOPPED_MEMORY);
+        self.sweep_flows();
+
+        // Члены и отметки — до снимка, не после: принятый или отмеченный
+        // между снимком и чтением (запущен после снимка) выглядел бы
+        // умершим. Кого прочли раньше и нет в снимке, тот, скорее всего,
+        // умер, — но снимается только на втором проходе подряд (см.
+        // `flows::Absence`).
+        let members = self.inner.lock().unwrap_or_else(|e| e.into_inner()).family.members_born();
+        let mut marked: Vec<u32> =
+            self.settled.lock().unwrap_or_else(|e| e.into_inner()).iter().copied().collect();
+        marked.extend(self.name_verdicts.lock().unwrap_or_else(|e| e.into_inner()).keys().copied());
+        // Снимок не удался — судить о том, кто жив, не по чему.
+        let alive: std::collections::HashSet<u32> =
+            proc::parents().into_iter().map(|(pid, _, _)| pid).collect();
+        if alive.is_empty() {
+            return;
+        }
+        // Время создания спрашивается без замка и только у живых, у кого
+        // есть с чем сравнить.
+        let seen: Vec<flows::Sighting> = members
+            .into_iter()
+            .map(|(pid, born)| {
+                let live = alive.contains(&pid);
+                let now = if live && born.is_some() { proc::created(pid) } else { None };
+                (pid, born, live, now)
+            })
+            .collect();
+        let stale = self.absence.lock().unwrap_or_else(|e| e.into_inner()).stale_members(seen);
+        for (pid, born) in &stale {
+            self.release(*pid, |family| family.stopped_if_born(*pid, *born));
+        }
+        if !stale.is_empty() {
+            self.store.log(&format!(
+                "путь B: снято с присмотра {} процессов, о завершении которых события не было",
+                stale.len()
+            ));
+        }
+        // Решения о мёртвых номерах достались бы новым хозяевам. Решение,
+        // что стирать, и само стирание — под одним замком `settled`: событие
+        // о запуске нового хозяина номера сперва снимает номер с памяти
+        // чистки и только потом ставит отметку, так что его отметка либо
+        // уже не в списке на стирание, либо ставится после стирания.
+        let stale_marks = {
+            let mut settled = self.settled.lock().unwrap_or_else(|e| e.into_inner());
+            let stale = self.absence.lock().unwrap_or_else(|e| e.into_inner()).stale_marks(marked, &alive);
+            settled.retain(|pid| !stale.contains(pid));
+            stale
+        };
+        if !stale_marks.is_empty() {
+            self.name_verdicts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|pid, _| !stale_marks.contains(pid));
+        }
+    }
+
+    /// Выбрасывает из таблицы потоки, которых нет в таблице соединений ядра
+    /// (см. `flows::Table::sweep`), и перестраивает фильтр, если что-то ушло.
+    fn sweep_flows(&self) {
+        if self.inner.lock().unwrap_or_else(|e| e.into_inner()).table.is_empty() {
+            return;
+        }
+        // Не прочитанная таблица — не пустая: выбросить по ней всё значило
+        // бы снять перехват с живых соединений. Пустая же подозрительна сама
+        // по себе: слушающие сокеты в системе есть всегда.
+        let connections = match tcptable::connections() {
+            Ok(connections) if !connections.is_empty() => connections,
+            _ => return,
+        };
+        let live: std::collections::HashSet<(u16, Ipv4Addr, u16)> =
+            connections.iter().map(|c| (c.local_port, c.remote, c.remote_port)).collect();
+        let alive = |key: &flows::Key| {
+            key.protocol != ipv4::PROTO_TCP
+                || live.contains(&(key.local_port, key.remote, key.remote_port))
+        };
+        let dropped = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .table
+            .sweep(Instant::now(), FLOW_GRACE, alive);
+        if dropped > 0 {
+            self.store.log(&format!(
+                "путь B: из фильтра убрано потоков {dropped} — их больше нет в системе, а события \
+                 о закрытии не было"
+            ));
+            self.rebuild();
+        }
+    }
+
     /// Собирает фильтр по нынешним потокам и подменяет динамическую ручку.
     ///
     /// Делается это **синхронно**, до того как отпущен SYN: иначе первые
     /// пакеты соединения успеют уйти мимо перехвата.
-    fn rebuild(&self) {
+    ///
+    /// Вся перестройка — под `rebuild_serial`: фильтр собирается по таблице
+    /// уже под ним, поэтому ручка, поставленная последней, собрана и по
+    /// последнему её состоянию. Ожидание замка входит в удержание SYN — это
+    /// цена того, что поток не выпадет из перехвата.
+    ///
+    /// Возвращает, стоит ли теперь фильтр, собранный по нынешней таблице.
+    /// `false` — новая ручка не открылась (или движок останавливается), и
+    /// потоков, добавленных в таблицу только что, в перехвате нет.
+    fn rebuild(&self) -> bool {
+        let _serial = self.rebuild_serial.lock().unwrap_or_else(|e| e.into_inner());
+        // Движок останавливается: ручки закрываются, и открывать новую —
+        // значит оставить после остановки ручку, которая глотает пакеты.
+        if self.stopping() {
+            return false;
+        }
         let started = Instant::now();
         let place = self.place();
         let (filter, count, wide) = match place.home() {
@@ -1721,7 +2133,7 @@ impl Engine {
                 let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
                 stats.rebuilds_spared += 1;
                 stats.peak_flows = stats.peak_flows.max(count);
-                return;
+                return true;
             }
         }
 
@@ -1733,7 +2145,7 @@ impl Engine {
                     self.store.log(&format!("путь B: фильтр на {count} потоков не открылся — {e}"));
                     let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
                     stats.failed += 1;
-                    return;
+                    return false;
                 }
             },
         };
@@ -1741,14 +2153,15 @@ impl Engine {
         // Старую ручку закрываем после того, как открыта новая: в этот
         // короткий промежуток пакеты идут мимо нас, и он должен быть как
         // можно короче. Пакеты, уже лежащие в очереди старой ручки, поток
-        // пакетов дочитывает сам, прежде чем перейти на новую.
+        // пакетов дочитывает сам, прежде чем перейти на новую; до тех пор
+        // ручку держит очередь заменённых.
         let previous = {
             let mut slot = self.dynamic.lock().unwrap_or_else(|e| e.into_inner());
             *self.dynamic_filter.lock().unwrap_or_else(|e| e.into_inner()) = filter.clone();
             std::mem::replace(&mut *slot, fresh)
         };
         if let Some(old) = previous {
-            old.stop();
+            retire(&self.dynamic_retired, old);
         }
 
         let spent = started.elapsed().as_micros();
@@ -1764,6 +2177,7 @@ impl Engine {
                 flows::MAX_IN_FILTER
             ));
         }
+        true
     }
 
     fn current(&self) -> Option<Arc<divert::Handle>> {
@@ -1816,6 +2230,8 @@ impl Engine {
             spawn("pathb-udp-out", Box::new(move || e.pump_udp_out(&udp_e)));
             spawn("pathb-udp-in", Box::new(move || f.pump_udp_in()));
             spawn("pathb-sockets", Box::new(move || g.watch_sockets(&sockets_g)));
+            let h = self.clone();
+            spawn("pathb-tidy", Box::new(move || h.tidy_loop()));
         }
         if let Some(e) = failure {
             self.stop.store(true, Ordering::Release);
@@ -1920,6 +2336,14 @@ impl Engine {
         }
         let ours = self.belongs(pid);
         let mut verdicts = self.name_verdicts.lock().unwrap_or_else(|e| e.into_inner());
+        // О заказчике спрашивают и после его смерти: заказчики имён живут
+        // `DNS_ASKED`. Событие о завершении уже обработано, стереть решение
+        // будет некому, и его получил бы новый хозяин номера. Сверка под
+        // замком решений: завершение отмечается раньше, чем стирается
+        // решение, так что опоздавшее завершение своё сотрёт само.
+        if self.recently_stopped(pid) {
+            return ours;
+        }
         // Событие о завершении могло потеряться; бесконечно расти карте
         // незачем, а стереть её — всего лишь решить заново.
         if verdicts.len() > 4096 {
@@ -1948,7 +2372,9 @@ impl Engine {
     fn name_owner(&self, name: &str, source_port: u16) -> (NameOwner, Option<u32>) {
         let owner = self
             .udp_owner_from_event(source_port, UDP_PATIENCE / 4)
-            .or_else(|| self.udp_owner_from_table(source_port));
+            // Таблица не прочиталась — решают события о заказчиках ниже, а
+            // при сомнении они выбирают «наш».
+            .or_else(|| self.udp_owner_from_table(source_port).ok().flatten());
         if let Some(pid) = owner {
             if self.name_verdict(pid) {
                 return (NameOwner::OwnSocket, Some(pid));
@@ -2082,6 +2508,13 @@ impl Engine {
     /// — или закрывает, если туннеля нет. Вызывается при запуске и при
     /// каждой смене положения.
     fn refresh_udp_in(&self) {
+        // По одному за раз, от чтения адреса до установки ручки: иначе
+        // ручка, открытая по старому адресу туннеля, могла лечь в слот
+        // последней (одновременные смена сети и новые дорожки).
+        let _serial = self.udp_in_serial.lock().unwrap_or_else(|e| e.into_inner());
+        if self.stopping() {
+            return;
+        }
         // Настоящее положение, а не то, что показывает проверка отказа:
         // под проверкой туннель на месте, и ответы по нему идут.
         let up = self.place.lock().unwrap_or_else(|e| e.into_inner()).tunnel().is_some();
@@ -2107,8 +2540,10 @@ impl Engine {
             let mut slot = self.udp_in.lock().unwrap_or_else(|e| e.into_inner());
             std::mem::replace(&mut *slot, fresh)
         };
+        // Ответы, уже лежащие в очереди старой ручки, дочитает поток
+        // ответов: при смене сети это ответы QUIC, игр, голоса.
         if let Some(old) = previous {
-            old.stop();
+            retire(&self.udp_in_retired, old);
         }
     }
 
@@ -2137,9 +2572,26 @@ impl Engine {
             // ещё ждать события, и закрывать сеанс под ним незачем.
             self.names_live.store(false, Ordering::Release);
             drop(live.names);
-            // Все ручки закрыты; снимать перехват больше нечего.
-            *self.dynamic.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            *self.dynamic_filter.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            // Все ручки закрыты; снимать перехват больше нечего. Под замками
+            // перестроек: начатая до остановки (её зовёт и поток ETW, а его
+            // мы не ждём) могла успеть поставить новую ручку — её тоже
+            // закрыть. Новых после этого не будет: флаг остановки поднят.
+            {
+                let _serial = self.rebuild_serial.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(handle) = self.dynamic.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    handle.stop();
+                }
+                *self.dynamic_filter.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+            {
+                let _serial = self.udp_in_serial.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(handle) = self.udp_in.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    handle.stop();
+                }
+            }
+            // Заменённые ручки дочитывать больше некому.
+            self.dynamic_retired.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            self.udp_in_retired.lock().unwrap_or_else(|e| e.into_inner()).clear();
             self.udp_ports.lock().unwrap_or_else(|e| e.into_inner()).clear();
         }
         std::mem::take(&mut *self.stats.lock().unwrap_or_else(|e| e.into_inner()))
@@ -2148,11 +2600,7 @@ impl Engine {
     /// Статическая ручка: начало соединения.
     fn pump_syn(&self, handle: &divert::Handle) {
         let mut buffer = vec![0u8; divert::MAX_PACKET];
-        loop {
-            let (length, mut address) = match handle.next_packet(&mut buffer) {
-                Ok(packet) => packet,
-                Err(_) => break,
-            };
+        while let Ok((length, mut address)) = handle.next_packet(&mut buffer) {
             let packet = &mut buffer[..length];
             let place = self.place();
             let mut rewritten = false;
@@ -2197,52 +2645,104 @@ impl Engine {
                             remote_port,
                         };
                         let owner = if inside { self.inside_owner(&key) } else { self.ours(&key) };
+                        // Таблица не прочиталась — хозяин неизвестен, и
+                        // выпустить начало домой значило бы, может быть,
+                        // выпустить своё. Пакет выбрасывается, приложение
+                        // повторит начало, и решать будем заново.
+                        let owner = match owner {
+                            Ok(owner) => owner,
+                            Err(TableUnread) => {
+                                discard = true;
+                                self.stats.lock().unwrap_or_else(|e| e.into_inner()).dropped += 1;
+                                None
+                            }
+                        };
                         if let Some(pid) = owner {
                             // Туннель у каждого правила свой. Не поднят он —
                             // соединение отклоняется, даже если рядом
                             // работает туннель другого правила.
                             match place.tunnel().and(self.tunnel_for(pid)) {
                                 Some(tunnel) => {
+                                    // Процесс мог завершиться (или потерять
+                                    // правило) между опознанием и этой
+                                    // строкой. Его поток, занесённый после
+                                    // `forget_process`, остался бы в таблице
+                                    // навсегда — поэтому проверка под тем же
+                                    // замком, что и запись.
                                     let fresh = {
                                         let mut inner =
                                             self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                                        let fresh = !inner.table.contains(&key);
-                                        inner.table.opened(key, pid);
-                                        fresh
+                                        if inner.family.contains(pid) {
+                                            let fresh = !inner.table.contains(&key);
+                                            inner.table.opened(key, pid);
+                                            Some(fresh)
+                                        } else {
+                                            None
+                                        }
                                     };
-                                    // Повторное начало того же соединения
-                                    // (первое потерялось в пути) — не новое
-                                    // соединение, и считать его дважды нельзя:
-                                    // счёт сверяется с числом соединений,
-                                    // которые процесс открыл.
-                                    // Соединения со своей сетью считаются
-                                    // отдельно (как местные), и вторым разом
-                                    // сюда не попадают.
-                                    if fresh && !inside {
-                                        self.seen
-                                            .lock()
-                                            .unwrap_or_else(|e| e.into_inner())
-                                            .entry(pid)
-                                            .or_default()
-                                            .led += 1;
-                                    }
+                                    // Наружу такое начало не отпускается: оно
+                                    // было нашим, и домашним адресом ему уходить
+                                    // нельзя. Сокет умершего процесса закрыт, а
+                                    // приложение, лишившееся правила, повторит
+                                    // попытку и пойдёт уже как чужое.
+                                    let Some(fresh) = fresh else {
+                                        self.stats.lock().unwrap_or_else(|e| e.into_inner()).dropped += 1;
+                                        if self.stopping() {
+                                            break;
+                                        }
+                                        continue;
+                                    };
                                     // Фильтр перестраивается, пока пакет у нас
                                     // в руках. Это и есть то самое удержание.
-                                    self.rebuild();
-                                    header.set_source(tunnel);
-                                    rewritten = true;
-                                    let decided = {
-                                        let mut stats =
-                                            self.stats.lock().unwrap_or_else(|e| e.into_inner());
-                                        stats.decided += 1;
-                                        stats.flows_opened += 1;
-                                        stats.decided
-                                    };
-                                    if decided <= 8 {
-                                        self.store.log(&format!(
-                                            "путь B: увожу в туннель {}:{} → {}:{}, процесс {pid}",
-                                            home.source, local_port, key.remote, remote_port
-                                        ));
+                                    //
+                                    // Не перестроился — потока в перехвате нет,
+                                    // и отпустить SYN нельзя никак: с адресом
+                                    // туннеля ответ не переписался бы, с
+                                    // домашним соединение ушло бы мимо VPN.
+                                    // Пакет выбрасывается, приложение повторит
+                                    // начало, и попытка будет заново.
+                                    if !self.rebuild() {
+                                        if fresh {
+                                            self.inner
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner())
+                                                .table
+                                                .closed(&key);
+                                        }
+                                        discard = true;
+                                        self.stats.lock().unwrap_or_else(|e| e.into_inner()).dropped += 1;
+                                    } else {
+                                        // Повторное начало того же соединения
+                                        // (первое потерялось в пути) — не новое
+                                        // соединение, и считать его дважды нельзя:
+                                        // счёт сверяется с числом соединений,
+                                        // которые процесс открыл.
+                                        // Соединения со своей сетью считаются
+                                        // отдельно (как местные), и вторым разом
+                                        // сюда не попадают.
+                                        if fresh && !inside {
+                                            self.seen
+                                                .lock()
+                                                .unwrap_or_else(|e| e.into_inner())
+                                                .entry(pid)
+                                                .or_default()
+                                                .led += 1;
+                                        }
+                                        header.set_source(tunnel);
+                                        rewritten = true;
+                                        let decided = {
+                                            let mut stats =
+                                                self.stats.lock().unwrap_or_else(|e| e.into_inner());
+                                            stats.decided += 1;
+                                            stats.flows_opened += 1;
+                                            stats.decided
+                                        };
+                                        if decided <= 8 {
+                                            self.store.log(&format!(
+                                                "путь B: увожу в туннель {}:{} → {}:{}, процесс {pid}",
+                                                home.source, local_port, key.remote, remote_port
+                                            ));
+                                        }
                                     }
                                 }
                                 // Туннеля нет. Поток в таблицу не заносим и
@@ -2308,10 +2808,17 @@ impl Engine {
     /// Чей это поток. Хозяина даёт таблица соединений ядра: на слое пакетов
     /// номера процесса нет, а сокет к этому моменту уже в таблице — он в
     /// состоянии SYN-SENT.
-    fn ours(&self, key: &flows::Key) -> Option<u32> {
-        let pid = match tcptable::owner(key.local_port, key.remote, key.remote_port) {
-            Some(pid) => pid,
-            None => {
+    ///
+    /// `Err` — таблицу соединений не прочитать даже со второй попытки: чьё
+    /// это начало, неизвестно, и пропускать его как чужое нельзя.
+    fn ours(&self, key: &flows::Key) -> Result<Option<u32>, TableUnread> {
+        // И первая попытка идёт через tcp_owner: её сбой тоже должен попасть
+        // в счётчик непрочитанных таблиц, а не обернуться «соединением без
+        // хозяина», если вторая прочитается и хозяина не найдёт.
+        let first = self.tcp_owner(key);
+        let pid = match first {
+            Ok(Some(pid)) => pid,
+            Ok(None) | Err(_) => {
                 // Хозяина нет. Раньше такое начало соединения молча
                 // пропускалось как чужое — а чьё оно, неизвестно, и нашим
                 // оно быть могло. Одна повторная попытка: сокет мог ещё не
@@ -2319,18 +2826,23 @@ impl Engine {
                 // попадают в журнал: это слепое пятно, и размер его надо
                 // знать.
                 std::thread::yield_now();
-                let again = tcptable::owner(key.local_port, key.remote, key.remote_port);
+                // Не прочиталась и вторая — хозяин неизвестен, а не «нет».
+                let again = self.tcp_owner(key)?;
+                // Первая не прочиталась, вторая прочиталась: это сбой
+                // чтения, а не опоздавший сокет — в «поздние» не идёт.
+                let missed = first.is_ok();
                 let (lost, late) = {
                     let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
                     match again {
-                        Some(_) => stats.syn_owner_late += 1,
+                        Some(_) if missed => stats.syn_owner_late += 1,
+                        Some(_) => {}
                         None => stats.syn_no_owner += 1,
                     }
                     (stats.syn_no_owner, stats.syn_owner_late)
                 };
                 match again {
                     Some(pid) => {
-                        if late <= 6 {
+                        if missed && late <= 6 {
                             self.store.log(&format!(
                                 "путь B: хозяин соединения с порта {} на {}:{} нашёлся только со \
                                  второй попытки — процесс {pid}",
@@ -2347,19 +2859,19 @@ impl Engine {
                                 key.local_port, key.remote, key.remote_port
                             ));
                         }
-                        return None;
+                        return Ok(None);
                     }
                 }
             }
         };
         if self.belongs(pid) {
-            return Some(pid);
+            return Ok(Some(pid));
         }
         // Чужое — отпускаем, но запоминаем за процессом: если он окажется
         // своим (опознан позже, чем соединился), это соединение ушло мимо
         // туннеля, и узнать об этом больше неоткуда.
         self.note_passed(pid, key);
-        None
+        Ok(None)
     }
 
     /// Начало соединения отпущено с домашним адресом: записать за хозяином.
@@ -2395,7 +2907,8 @@ impl Engine {
             return;
         }
         self.other_source_budget.store(left - 1, Relaxed);
-        let Some(pid) = tcptable::owner(key.local_port, key.remote, key.remote_port) else {
+        // Это только наблюдение: не прочиталась таблица — смотреть не на что.
+        let Ok(Some(pid)) = tcptable::owner(key.local_port, key.remote, key.remote_port) else {
             return;
         };
         if !self.inner.lock().unwrap_or_else(|e| e.into_inner()).family.contains(pid) {
@@ -2427,6 +2940,7 @@ impl Engine {
     /// он только что открыл сокет, — и его цепочка родителей проверяется в
     /// этот же момент.
     fn adopt_by_ancestry(&self, pid: u32) -> bool {
+        let taken = Instant::now();
         let snapshot = proc::parents();
         let parent_of: std::collections::HashMap<u32, u32> =
             snapshot.iter().map(|(p, parent, _)| (*p, *parent)).collect();
@@ -2444,38 +2958,75 @@ impl Engine {
             current = parent;
         }
 
-        // Ближайший предок, уже принятый в родословную, — и его правило.
-        let found = {
-            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            chain
-                .iter()
-                .enumerate()
-                .find_map(|(at, p)| inner.family.rule_of(*p).map(|rule| (at, rule.to_owned())))
-        }
-        // Иначе ближайший, кто подходит правилу сам.
-        .or_else(|| {
-            chain
-                .iter()
-                .enumerate()
-                .find_map(|(at, p)| self.rule_for(*p).map(|rule| (at, rule)))
-        });
+        // Снимок знает только номер родителя, а номера переиспользуются.
+        // Поэтому найденная цепочка сверяется по времени создания — как в
+        // `Family::grow`, — и при разрыве поиск повторяется по её началу.
+        // Время спрашивается, только когда предок нашёлся: у постороннего
+        // процесса, а их большинство, лишних системных вызовов нет.
+        let (at, rule, born) = loop {
+            // Ближайший предок, уже принятый в родословную, — и его правило.
+            let found = {
+                let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                chain.iter().enumerate().find_map(|(at, p)| {
+                    inner.family.rule_of(*p).map(|rule| (at, rule.to_owned(), inner.family.born(*p)))
+                })
+            }
+            // Иначе ближайший, кто подходит правилу сам.
+            .or_else(|| {
+                chain
+                    .iter()
+                    .enumerate()
+                    .find_map(|(at, p)| self.rule_for(*p).map(|rule| (at, rule, None)))
+            });
 
-        let Some((at, rule)) = found else { return false };
+            let Some((at, rule, kept)) = found else { return false };
+            let born: Vec<Option<u64>> = chain[..=at].iter().map(|p| proc::created(*p)).collect();
+            // Номер предка-члена уже у другого процесса: прежний умер, а
+            // событие о его завершении потерялось. Этот предок не наш.
+            if let (Some(kept), Some(now)) = (kept, born[at]) {
+                if kept != now {
+                    chain.truncate(at);
+                    if chain.is_empty() {
+                        return false;
+                    }
+                    continue;
+                }
+            }
+            // Ребёнок не бывает старше родителя: «родитель» в снимке — уже
+            // другой процесс с номером настоящего.
+            let broken = (0..at).find(|&i| {
+                matches!((born[i], born[i + 1]), (Some(child), Some(elder)) if child < elder)
+            });
+            match broken {
+                Some(i) => chain.truncate(i + 1),
+                None => break (at, rule, born),
+            }
+        };
         let fresh: Vec<u32> = {
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            // Кто из цепочки завершился после снимка, принят не будет: его
+            // событие о завершении уже обработано, и запись осталась бы
+            // навсегда. Завершение, обработанное позже, снимет её само.
+            // Завершение до снимка — о прежнем хозяине номера, и нынешнего
+            // оно не касается.
+            let stopped: Vec<bool> = chain[..=at].iter().map(|p| self.stopped_since(*p, taken)).collect();
             // Принимаем всю цепочку от найденного предка до самого
             // процесса: следующий его сокет опознается уже быстрым путём.
             chain[..=at]
                 .iter()
-                .copied()
-                .filter(|p| inner.family.started(*p, 0, Some(&rule)))
+                .zip(born.iter().zip(stopped))
+                .filter(|(_, (_, stopped))| !stopped)
+                .map(|(p, (born, _))| (*p, *born))
+                .filter(|(p, born)| inner.family.started_at(*p, 0, Some(&rule), *born))
+                .map(|(p, _)| p)
                 .collect()
         };
         self.announce();
         for pid in fresh {
             self.learn(pid, &rule, None);
         }
-        true
+        // Сам процесс мог завершиться после снимка — тогда он не принят.
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).family.contains(pid)
     }
 
     /// Динамическая ручка: пакеты живых потоков, в обе стороны.
@@ -2486,11 +3037,14 @@ impl Engine {
         // приём новых пакетов, а те, что уже лежат в её очереди, надо
         // дочитать и вернуть в сеть. Бери мы каждый раз самую свежую ручку,
         // эти пакеты пропадали бы молча — при каждой перестройке понемногу.
+        // Заменённые ручки, которых этот поток ещё не дочитал, лежат в
+        // `dynamic_retired`: при двух перестройках подряд держать
+        // промежуточную было бы иначе некому.
         let mut reading: Option<Arc<divert::Handle>> = None;
         while !self.stopping() {
             let handle = match &reading {
                 Some(handle) => handle.clone(),
-                None => match self.current() {
+                None => match next_handle(&self.dynamic_retired, &self.dynamic) {
                     Some(handle) => {
                         reading = Some(handle.clone());
                         handle
@@ -2502,13 +3056,15 @@ impl Engine {
                 },
             };
             // Отказ приёма — обычное дело, а не ошибка: очередь старой
-            // ручки дочитана, берём ту, что стоит сейчас. Если стоит та же
-            // самая, она сломана, и крутиться на ней вхолостую нельзя.
+            // ручки дочитана, берём следующую. Если стоит та же самая и
+            // дочитывать больше нечего, она сломана, и крутиться на ней
+            // вхолостую нельзя.
             let (length, mut address) = match handle.next_packet(&mut buffer) {
                 Ok(packet) => packet,
                 Err(_) => {
                     reading = None;
-                    let same = self.current().is_some_and(|now| Arc::ptr_eq(&now, &handle));
+                    let same = self.dynamic_retired.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+                        && self.current().is_some_and(|now| Arc::ptr_eq(&now, &handle));
                     if same {
                         std::thread::sleep(Duration::from_millis(20));
                     }
@@ -2614,11 +3170,7 @@ impl Engine {
     /// идёт весь DNS: лишнее имя в туннеле лучше имени мимо него.
     fn pump_dns(&self, handle: &divert::Handle) {
         let mut buffer = vec![0u8; divert::MAX_PACKET];
-        loop {
-            let (length, mut address) = match handle.next_packet(&mut buffer) {
-                Ok(packet) => packet,
-                Err(_) => break,
-            };
+        while let Ok((length, mut address)) = handle.next_packet(&mut buffer) {
             let outbound = address.outbound();
             let place = self.place();
             let packet = &mut buffer[..length];
@@ -2861,7 +3413,7 @@ impl Engine {
             // Записей не больше, чем портов, но держать сведения о давно
             // закрытых сокетах незачем.
             seen += 1;
-            if seen % 512 == 0 {
+            if seen.is_multiple_of(512) {
                 ports.retain(|_, port| port.used.elapsed() < UDP_IDLE);
             }
         }
@@ -2870,15 +3422,18 @@ impl Engine {
     /// Хозяин порта по таблице ядра. Если порт делят несколько процессов и
     /// среди них есть наш — отвечаем нашим: увести лишнее в туннель лучше,
     /// чем выпустить своё домой.
-    fn udp_owner_from_table(&self, local_port: u16) -> Option<u32> {
+    ///
+    /// `Err` — таблицу не прочитать: хозяин неизвестен, а не «порт ничей».
+    fn udp_owner_from_table(&self, local_port: u16) -> Result<Option<u32>, TableUnread> {
         self.stats.lock().unwrap_or_else(|e| e.into_inner()).udp_lookups += 1;
-        let owners = vpnsplit_net::udptable::owners(local_port);
+        let owners = vpnsplit_net::udptable::owners(local_port)
+            .map_err(|e| self.table_unread("сокетов UDP", &e))?;
         let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        owners
+        Ok(owners
             .iter()
             .copied()
             .find(|pid| inner.family.contains(*pid))
-            .or_else(|| owners.first().copied())
+            .or_else(|| owners.first().copied()))
     }
 
     /// Ждёт, пока поток событий запишет хозяина порта.
@@ -2900,15 +3455,21 @@ impl Engine {
 
     /// Наш ли это порт UDP. Вызывается на каждый исходящий пакет, поэтому
     /// обычный случай — одно обращение к карте и ничего больше.
-    fn udp_ours(&self, local_port: u16, remote: Ipv4Addr, remote_port: u16) -> bool {
+    ///
+    /// `None` — хозяин неизвестен, потому что таблицу сокетов не прочитали:
+    /// пакет надо не выпускать, а выбросить.
+    fn udp_ours(&self, local_port: u16, remote: Ipv4Addr, remote_port: u16) -> Option<bool> {
         let now = Instant::now();
+        let mut unread = false;
         let known = {
             let mut ports = self.udp_ports.lock().unwrap_or_else(|e| e.into_inner());
             match ports.get_mut(&local_port) {
                 Some(port) => {
                     port.used = now;
                     match port.ours {
-                        Some(ours) if now.duration_since(port.checked) < UDP_RECHECK => return ours,
+                        Some(ours) if now.duration_since(port.checked) < UDP_RECHECK => {
+                            return Some(ours)
+                        }
                         decided => Some((port.pid, decided)),
                     }
                 }
@@ -2922,7 +3483,12 @@ impl Engine {
             // Решение устарело. Перепроверяем хозяина по таблице; если
             // сокета там уже нет, верим прежнему знанию — пакет-то в руках.
             Some((pid, Some(ours))) => {
-                let owner = self.udp_owner_from_table(local_port).unwrap_or(pid);
+                let owner = match self.udp_owner_from_table(local_port) {
+                    Ok(owner) => owner.unwrap_or(pid),
+                    // Таблица не прочиталась: прежнее решение остаётся, но
+                    // срок его не продлевается — следующий пакет спросит снова.
+                    Err(TableUnread) => return Some(ours),
+                };
                 if owner == pid {
                     // Хозяин тот же, а родословная процесса не меняется:
                     // решение остаётся в силе, пересматривать его незачем.
@@ -2930,7 +3496,7 @@ impl Engine {
                     if let Some(port) = ports.get_mut(&local_port) {
                         port.checked = now;
                     }
-                    return ours;
+                    return Some(ours);
                 }
                 Some(owner)
             }
@@ -2941,9 +3507,21 @@ impl Engine {
             // таблица.
             None => self
                 .udp_owner_from_event(local_port, UDP_PATIENCE / 4)
-                .or_else(|| self.udp_owner_from_table(local_port))
+                .or_else(|| match self.udp_owner_from_table(local_port) {
+                    Ok(owner) => owner,
+                    Err(TableUnread) => {
+                        unread = true;
+                        None
+                    }
+                })
                 .or_else(|| self.udp_owner_from_event(local_port, UDP_PATIENCE)),
         };
+        // Хозяина нет ни в событиях, ни в таблице — потому что таблицу не
+        // прочитали. Это не «чужой»: пакет не выпускается, приложение
+        // повторит (UDP к потерям привычен), а решать будем заново.
+        if pid.is_none() && unread {
+            return None;
+        }
         let Some(pid) = pid else {
             let unknown = {
                 let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
@@ -2956,7 +3534,7 @@ impl Engine {
                      ни в событиях, ни в таблице; пропущен как чужой"
                 ));
             }
-            return false;
+            return Some(false);
         };
 
         let ours = self.belongs(pid);
@@ -2980,18 +3558,14 @@ impl Engine {
                 ));
             }
         }
-        ours
+        Some(ours)
     }
 
     /// Ручка UDP: весь исходящий UDP наружу. Наше — в туннель, чужое —
     /// обратно в сеть как было.
     fn pump_udp_out(&self, handle: &divert::Handle) {
         let mut buffer = vec![0u8; divert::MAX_PACKET];
-        loop {
-            let (length, address) = match handle.next_packet(&mut buffer) {
-                Ok(packet) => packet,
-                Err(_) => break,
-            };
+        while let Ok((length, address)) = handle.next_packet(&mut buffer) {
             let packet = &mut buffer[..length];
             let place = self.place();
             let mut rewritten = false;
@@ -3002,15 +3576,19 @@ impl Engine {
             if let (Some(home), Some(mut header)) = (place.home(), ipv4::Header::new(packet)) {
                 if header.source() == home.source {
                     if let Some((local_port, remote_port)) = header.ports() {
-                        if self.udp_ours(local_port, header.destination(), remote_port) {
-                            match place.tunnel().and(self.udp_tunnel(local_port)) {
+                        match self.udp_ours(local_port, header.destination(), remote_port) {
+                            Some(true) => match place.tunnel().and(self.udp_tunnel(local_port)) {
                                 Some(tunnel) => {
                                     header.set_source(tunnel);
                                     rewritten = true;
                                 }
                                 // Туннеля нет: пакет не возвращаем.
                                 None => discard = true,
-                            }
+                            },
+                            Some(false) => {}
+                            // Хозяин неизвестен — таблица не прочиталась:
+                            // своё могло бы уйти домой, пакет не возвращаем.
+                            None => discard = true,
                         }
                     }
                 }
@@ -3044,24 +3622,40 @@ impl Engine {
     /// Обратное направление UDP: ответы, пришедшие на адрес туннеля.
     fn pump_udp_in(&self) {
         let mut buffer = vec![0u8; divert::MAX_PACKET];
+        // Ручка, которую читаем, держится между оборотами — как в
+        // `pump_dynamic`: при замене старой закрывают только приём новых
+        // пакетов, а ответы в её очереди надо дочитать и доставить. Бери мы
+        // каждый оборот ручку из ячейки, при первом же пакете после замены
+        // старая закрылась бы вместе со своей очередью.
+        let mut reading: Option<Arc<divert::Handle>> = None;
         while !self.stopping() {
-            let current = self.udp_in.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            let Some(handle) = current else {
-                std::thread::sleep(Duration::from_millis(20));
-                continue;
+            let handle = match &reading {
+                Some(handle) => handle.clone(),
+                None => match next_handle(&self.udp_in_retired, &self.udp_in) {
+                    Some(handle) => {
+                        reading = Some(handle.clone());
+                        handle
+                    }
+                    None => {
+                        std::thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
+                },
             };
             let (length, mut address) = match handle.next_packet(&mut buffer) {
                 Ok(packet) => packet,
                 Err(_) => {
-                    // Ручку подменили — возьмём новую. Но если в ячейке всё
-                    // та же, она сломана, и крутиться на ней вхолостую
-                    // нельзя.
-                    let same = self
-                        .udp_in
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .as_ref()
-                        .is_some_and(|now| Arc::ptr_eq(now, &handle));
+                    // Очередь дочитана — возьмём следующую ручку. Но если в
+                    // ячейке всё та же и дочитывать больше нечего, она
+                    // сломана, и крутиться на ней вхолостую нельзя.
+                    reading = None;
+                    let same = self.udp_in_retired.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+                        && self
+                            .udp_in
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .as_ref()
+                            .is_some_and(|now| Arc::ptr_eq(now, &handle));
                     if same {
                         std::thread::sleep(Duration::from_millis(20));
                     }
@@ -3127,8 +3721,16 @@ impl Engine {
             if divert::describe_event(address.event()) != "поток закрыт" {
                 continue;
             }
-            let std::net::IpAddr::V4(remote) = address.remote() else {
-                continue;
+            // Сокет двойного режима сообщает адрес IPv4 как `::ffff:a.b.c.d`,
+            // а на проводе это обычный IPv4 и в таблице он под IPv4 — без
+            // этого его закрытие таблицы не достигало бы и запись ждала бы
+            // уборки.
+            let remote = match address.remote() {
+                std::net::IpAddr::V4(remote) => remote,
+                std::net::IpAddr::V6(remote) => match remote.to_ipv4_mapped() {
+                    Some(remote) => remote,
+                    None => continue,
+                },
             };
             let key = flows::Key {
                 protocol: socket.protocol,
@@ -3166,14 +3768,15 @@ pub fn describe(stats: &Stats) -> String {
     let waits = format!(
         "; ожиданий запуска {} (в среднем {wait} мкс, худшее {} мкс; не дождались {}, \
          оказались нашими {}); начал соединений без хозяина {} (нашёлся со второй попытки \
-         у {}); своих не с домашнего адреса {}",
+         у {}); своих не с домашнего адреса {}; таблица ядра не прочиталась {}",
         stats.start_waits,
         stats.start_wait_worst,
         stats.start_waits_empty,
         stats.start_waits_adopted,
         stats.syn_no_owner,
         stats.syn_owner_late,
-        stats.ours_other_source
+        stats.ours_other_source,
+        stats.table_unread
     );
     let line = format!(
         "начал соединений видено {} (из них подсунутых {}), решений {}, \
@@ -3310,6 +3913,27 @@ mod tests {
         assert_eq!(asked.askers("old.example", t0 + Duration::from_secs(4)), vec![100]);
         // …а через минуту имя ничьё: новый запрос — новый заказчик.
         assert!(asked.askers("old.example", t0 + Duration::from_secs(60)).is_empty());
+    }
+
+    /// Имена, ушедшие «домой», копятся и без событий о заказчиках — у
+    /// программы со своим разрешателем их нет вовсе.
+    #[test]
+    fn names_sent_home_do_not_pile_up_without_events() {
+        let t0 = Instant::now();
+        let mut asked = Asked::default();
+        for i in 0..600 {
+            asked.went_home(&format!("old{i}.example"), t0);
+        }
+        let later = t0 + Duration::from_secs(60);
+        for i in 0..600 {
+            asked.went_home(&format!("new{i}.example"), later);
+        }
+        assert!(asked.sent_home.len() <= 600, "старые имена не чистятся: {}", asked.sent_home.len());
+        assert!(asked.sent_home.keys().all(|name| name.starts_with("new")));
+
+        asked.note("asked.example", 7, later);
+        asked.tidy(later + Duration::from_secs(60));
+        assert!(asked.sent_home.is_empty() && asked.names.is_empty());
     }
 
     #[test]

@@ -297,6 +297,11 @@ impl Files {
             log: format!("openvpn-{id}.log"),
         }
     }
+
+    /// Все файлы подключения — чтобы убрать их разом.
+    fn all(&self) -> [&String; 6] {
+        [&self.config, &self.pass, &self.auth, &self.once, &self.off, &self.log]
+    }
 }
 
 /// Одно подключение и поток, который за ним присматривает.
@@ -355,9 +360,28 @@ impl Vpn {
         let files = Files::of(id);
         let dismissed = |why: &str| {
             store.log(&format!("подключение «{name}»: {why} — не используется; выбери конфиг заново"));
+            // Из списка оно уходит — значит, и его файлы: иначе пароль ключа
+            // и логин лежали бы на диске бессрочно, а подключение, которому
+            // потом достанется этот номер, унаследовало бы чужую пометку
+            // «отключено человеком».
+            for file in files.all() {
+                if let Err(e) = store.remove(file) {
+                    store.log(&format!("файл {file} отброшенного подключения не убран: {e}"));
+                }
+            }
             None
         };
         let Some(text) = store.load_text(&files.config) else {
+            if store.dir().join(&files.config).exists() {
+                // Файл есть, но не прочитался (о причине — строка в журнале):
+                // это не повод стирать конфиг с паролями.
+                store.log(&format!(
+                    "подключение «{name}»: конфиг не прочитался — не используется; файлы {} оставлены \
+                     на месте",
+                    files.config
+                ));
+                return None;
+            }
             return dismissed("конфига на диске нет");
         };
         let config = match ovpn::sanitize(&text) {
@@ -374,7 +398,16 @@ impl Vpn {
         // должно лежать то, что прошло бы их сегодня.
         if config.text != text {
             if let Err(e) = store.save_secret(&files.config, &config.text) {
-                return dismissed(&format!("сохранённый конфиг не удалось переписать ({e})"));
+                // Сбой записи разовый (место, антивирус держит файл) — не
+                // повод стирать годный конфиг с паролями. Но и запускать
+                // нельзя: OpenVPN читает файл с диска, а там ещё текст,
+                // не прошедший нынешних правил.
+                store.log(&format!(
+                    "подключение «{name}»: сохранённый конфиг не удалось переписать ({e}) — не \
+                     используется; файлы {} оставлены на месте",
+                    files.config
+                ));
+                return None;
             }
         }
         store.log(&format!("подключение «{name}»: конфиг есть, сервер {}", config.remote));
@@ -578,9 +611,7 @@ impl Vpn {
     /// Опустить подключение, дождаться потока и убрать файлы.
     fn retire(&self) {
         self.shutdown();
-        for name in
-            [&self.files.config, &self.files.pass, &self.files.auth, &self.files.once, &self.files.off, &self.files.log]
-        {
+        for name in self.files.all() {
             if let Err(e) = self.store.remove(name) {
                 self.say(&format!("файл {name} не убран: {e}"));
             }
@@ -706,7 +737,11 @@ impl Vpn {
                 };
                 if let Some(why) = hopeless {
                     self.say(why);
-                    blocked = Some((self.lock().serial, why));
+                    // Отказ относится к тому конфигу, с которым OpenVPN
+                    // запускали (`seen`), а не к нынешнему: конфиг или логин
+                    // могли сменить, пока код выхода ещё не забран, — новый
+                    // ещё ни разу не пробовали.
+                    blocked = Some((seen, why));
                     continue;
                 }
                 let why = last_words(&log)
@@ -954,6 +989,20 @@ pub struct Vpns {
     /// сразу знало, ждут ли его.
     policy: Mutex<Policy>,
     started: std::sync::atomic::AtomicBool,
+    /// Изменение состава — по одному за раз: от поиска подключения по имени
+    /// и выбора номера нового до того, как оно легло в список и в индекс.
+    /// Без этого два одновременных `set_config` получали один номер, и
+    /// второе затирало файлы первого. Порядок замков: `membership`, затем
+    /// `index_serial`, затем `list`; `list` держится только коротко.
+    membership: Mutex<()>,
+    /// Запись индекса — по одной за раз: снимок списка и запись идут под
+    /// ним, иначе более старый снимок мог лечь на диск последним.
+    index_serial: Mutex<()>,
+    /// Можно ли писать индекс поверх того, что на диске. Нет — прежний
+    /// список не прочитался или не разобрался, и в памяти его подключений
+    /// нет: первая же перемена иначе записала бы короткий список поверх
+    /// длинного. Перед такой записью прежний файл откладывается.
+    index_trusted: std::sync::atomic::AtomicBool,
 }
 
 impl Vpns {
@@ -965,9 +1014,11 @@ impl Vpns {
             listener: Mutex::new(None),
             probing: Mutex::new(()),
         });
-        let mut index = store.load_text(INDEX_FILE).and_then(|text| index_from_json(&text)).unwrap_or_default();
+        let (mut index, trusted) = read_index(&store);
         // Конфиг первой версии, когда подключение было одно и без имени.
-        if index.is_empty() && store.dir().join(OLD_CONFIG).is_file() {
+        // Только если списка действительно нет: при битом списке файлы
+        // `vpn-1.*` могут быть живыми, и переименование легло бы поверх них.
+        if trusted && index.is_empty() && store.dir().join(OLD_CONFIG).is_file() {
             let files = Files::of(1);
             let dir = store.dir();
             let moved = std::fs::rename(dir.join(OLD_CONFIG), dir.join(&files.config)).is_ok();
@@ -985,10 +1036,17 @@ impl Vpns {
             list: Mutex::new(list),
             policy: Mutex::new(Policy::default()),
             started: std::sync::atomic::AtomicBool::new(false),
+            membership: Mutex::new(()),
+            index_serial: Mutex::new(()),
+            index_trusted: std::sync::atomic::AtomicBool::new(trusted),
         });
         // Что не загрузилось — из списка уходит: иначе имя висело бы
-        // занятым, а подключения за ним не было бы.
-        vpns.save_index();
+        // занятым, а подключения за ним не было бы. Список, который не
+        // прочитался, не переписывается пустым: он отложен или остался
+        // как был, и по нему подключения можно вернуть.
+        if trusted {
+            vpns.save_index();
+        }
         vpns
     }
 
@@ -997,13 +1055,36 @@ impl Vpns {
     }
 
     fn save_index(&self) {
+        let _serial = self.index_serial.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.index_trusted.load(std::sync::atomic::Ordering::SeqCst) {
+            // Не прочитанный при запуске список не затирается: он уходит в
+            // сторону целым, и по нему прежние подключения можно вернуть.
+            // Битый уже мог быть отложен при чтении — тогда его нет.
+            let path = self.store.dir().join(INDEX_FILE);
+            match crate::store::set_aside(&path) {
+                Ok(aside) => self.store.log(&format!(
+                    "свои подключения: прежний список {} так и не прочитан — отложен в {}, новый \
+                     пишется заново",
+                    path.display(),
+                    aside.display()
+                )),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    self.store.log(&format!(
+                        "свои подключения: список не записан — прежний {} не прочитан, а отложить \
+                         его не удалось ({e}); перемены продержатся до перезапуска службы",
+                        path.display()
+                    ));
+                    return;
+                }
+            }
+            self.index_trusted.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         let index: Vec<(u32, String)> = self.list().iter().map(|vpn| (vpn.id, vpn.name.clone())).collect();
         let saved = if index.is_empty() {
             self.store.remove(INDEX_FILE)
         } else {
-            let path = self.store.dir().join(INDEX_FILE);
-            let tmp = path.with_extension("json.tmp");
-            std::fs::write(&tmp, index_to_json(&index)).and_then(|()| std::fs::rename(&tmp, &path))
+            self.store.save_text(INDEX_FILE, &index_to_json(&index))
         };
         if let Err(e) = saved {
             self.store.log(&format!(
@@ -1082,15 +1163,34 @@ impl Vpns {
             probe(&self.store, &config, secrets)?
         };
 
+        // Замок состава — от поиска по имени до записи индекса: номер
+        // нового подключения выбирается и занимается за один раз. Проверка
+        // OpenVPN вхолостую (секунды) идёт выше, без этого замка.
+        let membership = self.membership.lock().unwrap_or_else(|e| e.into_inner());
         let existing = self.list().iter().find(|vpn| same_name(&vpn.name, &name)).cloned();
         match existing {
-            Some(vpn) => vpn.accept(&config, secrets, checked)?,
-            None => {
-                let id = self.list().iter().map(|vpn| vpn.id).max().unwrap_or(0) + 1;
-                let vpn = Vpn::new(&self.store, &self.hub, id, &name, &config);
+            Some(vpn) => {
                 vpn.accept(&config, secrets, checked)?;
+                drop(membership);
+            }
+            None => {
+                let id = next_id(&self.list(), self.store.dir());
+                let vpn = Vpn::new(&self.store, &self.hub, id, &name, &config);
+                if let Err(e) = vpn.accept(&config, secrets, checked) {
+                    // Пароли пишутся раньше конфига и могли уже лечь. Номер
+                    // ещё ничей (мы под замком состава), а без уборки файлы
+                    // остались бы навсегда: next_id видит их и выдаёт
+                    // следующий номер, а ни список, ни индекс о них не знают.
+                    for file in vpn.files.all() {
+                        if let Err(err) = self.store.remove(file) {
+                            self.store.log(&format!("{name}: файл {file} несостоявшегося подключения не убран: {err}"));
+                        }
+                    }
+                    return Err(e);
+                }
                 self.list().push(vpn.clone());
                 self.save_index();
+                drop(membership);
                 if self.started.load(std::sync::atomic::Ordering::Acquire) {
                     vpn.start(false);
                 }
@@ -1149,11 +1249,16 @@ impl Vpns {
 
     /// Забыть подключение. Без имени — все.
     pub fn clear_config(&self, name: Option<&str>) -> Result<(), String> {
+        let membership = self.membership.lock().unwrap_or_else(|e| e.into_inner());
         let gone: Vec<Arc<Vpn>> = {
             let mut list = self.list();
             let (gone, kept) = std::mem::take(&mut *list)
                 .into_iter()
-                .partition(|vpn| name.is_none_or(|name| same_name(&vpn.name, name)));
+                // Не `is_none_or`: он появился только в 1.82.
+                .partition(|vpn| match name {
+                    Some(name) => same_name(&vpn.name, name),
+                    None => true,
+                });
             *list = kept;
             gone
         };
@@ -1164,10 +1269,14 @@ impl Vpns {
             };
         }
         self.save_index();
-        // Опускаются без замка списка: остановка OpenVPN — это секунды.
+        // Опускаются без замка списка: остановка OpenVPN — это секунды. А
+        // замок состава держится до конца: номер забытого подключения
+        // освободился, и новое, получив его, не должно лишиться своих
+        // файлов, которые здесь ещё убираются.
         for vpn in &gone {
             vpn.retire();
         }
+        drop(membership);
         // Первым могло стать другое подключение — и нужным тоже.
         self.apply_policy();
         self.hub.changed();
@@ -1185,6 +1294,17 @@ impl Vpns {
             adapters.iter().find(|a| a.name == name && a.usable()).and_then(|a| a.ipv4)
         };
         list.iter().map(|vpn| vpn.state(&address_of)).collect()
+    }
+
+    /// DNS, который сервер назначил нашему подключению на этом адаптере
+    /// (`dhcp-option DNS` из журнала OpenVPN). Пусто — адаптер не наш,
+    /// подключение не работает или сервер DNS не назначил.
+    pub fn dns_of(&self, adapter: &str) -> Vec<Ipv4Addr> {
+        let list = self.list().clone();
+        list.iter()
+            .find(|vpn| vpn.adapter().as_deref() == Some(adapter))
+            .map(|vpn| vpn.pushed().dns)
+            .unwrap_or_default()
     }
 
     /// Дорожки для перехвата: правило пути B → куда его вести.
@@ -1287,6 +1407,69 @@ fn index_to_json(index: &[(u32, String)]) -> String {
     let list: Vec<serde_json::Value> =
         index.iter().map(|(id, name)| serde_json::json!({ "id": id, "name": name })).collect();
     serde_json::Value::Array(list).to_string()
+}
+
+/// Список своих подключений с диска — и можно ли ему верить. Неправда —
+/// файл есть, но не прочитался или не разобрался (например, обрезан
+/// сбоем питания): такой список не переписывается, а битый откладывается
+/// в сторону, как и `policy.json`, — по нему подключения можно вернуть
+/// руками, их конфиги остаются на месте. Не прочитанный остаётся как был
+/// (после перезапуска он, может быть, прочтётся), а откладывается лишь
+/// перед первой записью нового — см. `Vpns::save_index`.
+fn read_index(store: &Store) -> (Vec<(u32, String)>, bool) {
+    let path = store.dir().join(INDEX_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), true),
+        Err(e) => {
+            store.log(&format!(
+                "свои подключения: {} не прочитался ({e}) — до перезапуска службы их нет; при \
+                 первой перемене он будет отложен в сторону",
+                path.display()
+            ));
+            return (Vec::new(), false);
+        }
+    };
+    match index_from_json(&text) {
+        Some(index) => (index, true),
+        None => {
+            let kept = match crate::store::set_aside(&path) {
+                Ok(aside) => format!("отложен в {}", aside.display()),
+                Err(e) => format!("отложить не удалось ({e}), оставлен как есть"),
+            };
+            store.log(&format!(
+                "свои подключения: список {} не разобран, {kept}; конфиги vpn-*.ovpn остались на \
+                 месте — подключения надо задать заново",
+                path.display()
+            ));
+            (Vec::new(), false)
+        }
+    }
+}
+
+/// Номер подключения по имени его файла: `vpn-3.ovpn`, `openvpn-3.log`,
+/// а также временные файлы их записи.
+fn id_of_file(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("vpn-").or_else(|| name.strip_prefix("openvpn-"))?;
+    let (digits, _) = rest.split_once('.')?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Номер нового подключения: больше всех, что есть в списке **и на
+/// диске**. Файлы подключения, которого нет в списке (список не
+/// разобрался и отложен), новое не должно ни перезаписать, ни
+/// унаследовать — ни пароль, ни пометку «отключено человеком».
+fn next_id(list: &[Arc<Vpn>], dir: &Path) -> u32 {
+    let listed = list.iter().map(|vpn| vpn.id).max().unwrap_or(0);
+    let on_disk = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries.flatten().filter_map(|entry| id_of_file(&entry.file_name().to_string_lossy())).max().unwrap_or(0)
+        })
+        .unwrap_or(0);
+    listed.max(on_disk).saturating_add(1)
 }
 
 fn index_from_json(text: &str) -> Option<Vec<(u32, String)>> {
@@ -1395,7 +1578,9 @@ struct Spawned {
 /// закроется вместе с нашим процессом, как бы тот ни завершился.
 fn spawn(exe: &Path, arguments: Vec<OsString>, log: &Path) -> Result<Spawned, String> {
     let failed = |what: &str, e: std::io::Error| format!("{what}: {e}");
-    let output = std::fs::File::create(log).map_err(|e| failed("журнал OpenVPN не открылся", e))?;
+    // Не `File::create`: тот прошёл бы по ссылке, подложенной на месте
+    // журнала, и служба от SYSTEM усекла бы чужой файл.
+    let output = crate::store::open_log(log, true).map_err(|e| failed("журнал OpenVPN не открылся", e))?;
     let errors = output.try_clone().map_err(|e| failed("журнал OpenVPN не открылся", e))?;
 
     let job = Handle(unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) });
@@ -1856,6 +2041,8 @@ mod tests {
         let without = Vpns::open(store.clone());
         assert_eq!(without.states().len(), 1);
         assert_eq!(without.states()[0].name, "Работа");
+        // Его файлы уходят вместе с ним: ни конфига с ключом, ни пометок.
+        assert!(!dir.join("vpn-1.ovpn").exists() && !dir.join("vpn-1.off").exists());
         // Забыть по имени — файлов нет; того, чего нет, забыть нельзя.
         assert!(without.clear_config(Some("Зарубежный")).is_err());
         without.clear_config(Some("РАБОТА")).unwrap();
@@ -1874,6 +2061,59 @@ mod tests {
         assert_eq!(old.states()[0].name, "VPN");
         assert!(store.load_text(OLD_CONFIG).is_none() && store.load_text("vpn-1.ovpn").is_some());
         old.clear_config(None).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_broken_list_is_set_aside_and_its_files_are_not_reused() {
+        let dir = std::env::temp_dir().join(format!("vpnsplit-vpn-broken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::scratch(dir.clone());
+        // Списка нет — это пустой список, и верить ему можно.
+        assert_eq!(read_index(&store), (Vec::new(), true));
+        // Обрезанный сбоем питания список не стирается, а откладывается.
+        std::fs::write(dir.join(INDEX_FILE), b"[{\"id\":1,\"na").unwrap();
+        std::fs::write(dir.join("vpn-1.ovpn"), b"client
+").unwrap();
+        std::fs::write(dir.join("vpn-1.off"), b"").unwrap();
+        let vpns = Vpns::open(store.clone());
+        assert!(vpns.states().is_empty());
+        assert!(dir.join("vpns.json.broken").is_file(), "битый список отложен");
+        assert!(dir.join("vpn-1.ovpn").is_file(), "конфиг за битым списком не тронут");
+        // Новое подключение не наследует ни номер, ни пометку «отключено».
+        assert_eq!(next_id(&vpns.list(), &dir), 2);
+        assert_eq!(id_of_file("vpn-12.ovpn"), Some(12));
+        assert_eq!(id_of_file("openvpn-3.log"), Some(3));
+        assert_eq!(id_of_file("vpn-7.pass.tmp-1"), Some(7));
+        assert_eq!(id_of_file("vpns.json"), None);
+        assert_eq!(id_of_file("vpn-.ovpn"), None);
+        assert_eq!(id_of_file("vpn-+1.ovpn"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unread_list_is_not_overwritten_by_the_first_change() {
+        let dir = std::env::temp_dir().join(format!("vpnsplit-vpn-unread-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::scratch(dir.clone());
+        // Каталог на месте списка читается с ошибкой, но не `NotFound` —
+        // как файл, который держит антивирус.
+        std::fs::create_dir_all(dir.join(INDEX_FILE)).unwrap();
+        std::fs::write(dir.join(INDEX_FILE).join("прежний"), b"").unwrap();
+        let vpns = Vpns::open(store.clone());
+        assert!(vpns.states().is_empty());
+        assert!(dir.join(INDEX_FILE).is_dir(), "при запуске не прочитанный список не трогается");
+        // Первая перемена: прежний список уходит в сторону, а не затирается.
+        let config = ovpn::sanitize(
+            "client\ndev tun\nremote 203.0.113.7 3333\n<ca>\nA\n</ca>\n<cert>\nB\n</cert>\n<key>\nC\n</key>\n",
+        )
+        .unwrap();
+        vpns.list().push(Vpn::new(&vpns.store, &vpns.hub, 1, "Новое", &config));
+        vpns.save_index();
+        assert!(dir.join("vpns.json.broken").join("прежний").is_file(), "прежний список отложен целым");
+        assert_eq!(read_index(&store), (vec![(1, "Новое".to_owned())], true));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
