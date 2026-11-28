@@ -1,13 +1,15 @@
 //! Библиотека, загружаемая в процесс, запущенный через лончер.
 //!
-//! Две обязанности:
+//! Три обязанности:
 //! 1. Каждому сокету IPv4/IPv6 ставит `IP_UNICAST_IF` (и `IPV6_UNICAST_IF`)
 //!    с индексом интерфейса туннеля. Сокеты, которые биндятся или
 //!    подключаются к локальным адресам (loopback и домашняя сеть), от
 //!    привязки освобождаются: программы общаются сами с собой через
 //!    127.0.0.1 и ходят к роутеру, а привязанный к туннелю сокет туда
 //!    не достаёт.
-//! 2. Перехватывает создание процессов и внедряет себя в потомков —
+//! 2. Разрешает имена сам, через туннель (`getaddrinfo` и родня,
+//!    `gethostbyname`, `WSAConnectByName`, `DnsQuery_*`), с учётом hosts.
+//! 3. Перехватывает создание процессов и внедряет себя в потомков —
 //!    у браузеров сеть живёт не в главном процессе.
 //!
 //! Правила, которые здесь нарушать нельзя:
@@ -18,12 +20,13 @@
 
 mod dns;
 mod hooks;
+mod hosts;
 mod log;
 
 use std::ffi::c_void;
 use std::panic::catch_unwind;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::OnceLock;
 use vpnsplit_core::hook::{status, IFINDEX_ENV};
 use windows_sys::Win32::System::LibraryLoader::{
@@ -35,9 +38,20 @@ use windows_sys::Win32::System::LibraryLoader::{
 static IFINDEX: AtomicU32 = AtomicU32::new(0);
 /// Сколько сокетов привязано. Для журнала и будущей статистики.
 static BOUND: AtomicU32 = AtomicU32::new(0);
-/// Путь к самой себе и смещение init — нужны для внедрения в потомков.
+/// Путь к самой себе — нужен для внедрения в потомков. Адрес init в потомке
+/// ищется по таблице экспорта: к тому времени под этим путём может лежать
+/// уже другая сборка, и своё смещение для неё не годится.
 static SELF_PATH: OnceLock<PathBuf> = OnceLock::new();
-static INIT_OFFSET: AtomicUsize = AtomicUsize::new(0);
+
+/// Поставлены ли хуки: не ноль, когда `install` прошёл целиком
+/// (`hook::READY_EXPORT`). Экспортируется как данные, а не функция: служба
+/// читает его из чужого процесса через ReadProcessMemory, ничего в нём не
+/// запуская. Одного факта загрузки DLL мало — потомка, у которого init не
+/// сработал или не успел, `attach_child` всё равно отпускает работать, и
+/// без этого признака служба показывала бы его идущим через туннель.
+#[no_mangle]
+#[allow(non_upper_case_globals)]
+pub static vpnsplit_hook_ready: AtomicU32 = AtomicU32::new(0);
 
 /// Версия ABI. 2 — индекс передаётся параметром init.
 #[no_mangle]
@@ -80,6 +94,9 @@ fn init(param: u32) -> u32 {
     log::open();
 
     let code = hooks::install(index);
+    if code == status::OK {
+        vpnsplit_hook_ready.store(1, Ordering::SeqCst);
+    }
     log::write(&format!(
         "init: индекс {index}, {} (код {code})",
         status::describe(code)
@@ -87,8 +104,8 @@ fn init(param: u32) -> u32 {
     code
 }
 
-/// Запоминает собственный путь и смещение init — по ним hook.dll внедряет
-/// себя в потомков ровно так же, как лончер внедрил её сюда.
+/// Запоминает собственный путь — по нему hook.dll внедряет себя в потомков
+/// ровно так же, как лончер внедрил её сюда.
 fn remember_self() {
     let anchor = vpnsplit_hook_init as *const u16;
     let mut module = std::ptr::null_mut();
@@ -102,10 +119,6 @@ fn remember_self() {
     if ok == 0 {
         return;
     }
-    INIT_OFFSET.store(
-        vpnsplit_hook_init as *const () as usize - module as usize,
-        Ordering::SeqCst,
-    );
 
     let mut buf = [0u16; 1024];
     let len = unsafe { GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32) } as usize;
