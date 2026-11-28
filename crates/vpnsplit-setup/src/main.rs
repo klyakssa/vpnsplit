@@ -25,7 +25,15 @@ mod payload {
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SERVICE_DOES_NOT_EXIST, GetLastError};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_SERVICE_DOES_NOT_EXIST, GetLastError, BOOL, HANDLE, HWND, LPARAM, WAIT_OBJECT_0,
+};
+use windows_sys::Win32::Security::{
+    DuplicateTokenEx, SecurityImpersonation, SetTokenInformation, TokenPrimary, TokenSessionId,
+    TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_QUERY,
+};
+use windows_sys::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
+use windows_sys::Win32::System::RemoteDesktop::{ProcessIdToSessionId, WTSQueryUserToken};
 use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
@@ -42,12 +50,15 @@ use windows_sys::Win32::System::Services::{
     SERVICE_STOP, SERVICE_STOPPED,
 };
 use windows_sys::Win32::System::Threading::{
-    OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    CreateProcessAsUserW, GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken,
+    QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT,
+    PROCESS_INFORMATION, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    PROCESS_TERMINATE, STARTF_FORCEOFFFEEDBACK, STARTUPINFOW,
 };
 use windows_sys::Win32::UI::Shell::{IsUserAnAdmin, ShellExecuteW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    MessageBoxW, IDOK, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OKCANCEL,
-    SW_SHOWNORMAL,
+    EnumWindows, GetWindow, GetWindowThreadProcessId, IsWindowVisible, MessageBoxW, GW_OWNER, IDOK,
+    MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OKCANCEL, SW_SHOWNORMAL,
 };
 
 /// Имя службы — то же, что в `vpnsplit_core::SERVICE_NAME`. Вписано сюда,
@@ -60,6 +71,19 @@ const TITLE: &str = "vpnsplit — установка";
 const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\vpnsplit";
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// Журнал установщика: в каталоге данных, а если ему нельзя верить — в
+/// папке установки (см. `note`).
+const LOG: &str = "setup.log";
+
+/// Ключ, с которым установщик запускает сам себя в сеансе пользователя:
+/// «есть ли у этих процессов окно на виду» (см. `shown_in`). Ответ — код
+/// выхода; коды необычные, чтобы ни сбой, ни чужой выход за ответ не сошли.
+const SHOWN_FLAG: &str = "/shown";
+const SHOWN: i32 = 0x5653_0001;
+const HIDDEN: i32 = 0x5653_0000;
+/// Сколько ждать этого ответа. Не дождались — окно считается спрятанным,
+/// как и было до проверки.
+const SHOWN_PATIENCE_MS: u32 = 5000;
 
 /// Сколько ждать остановки службы: она сама ждёт, пока выйдет OpenVPN.
 const STOP_PATIENCE: Duration = Duration::from_secs(45);
@@ -74,6 +98,11 @@ fn message(text: &str, flags: u32) -> i32 {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Мы же, запущенные из `shown_in` в сеансе пользователя: только ответить.
+    // До проверки прав — ни установки, ни вопросов.
+    if let Some(pids) = shown_pids(&args) {
+        std::process::exit(if any_shown(&pids) { SHOWN } else { HIDDEN });
+    }
     let quiet = args.iter().any(|a| a.eq_ignore_ascii_case("/quiet"));
     let removing = args.iter().any(|a| a.eq_ignore_ascii_case("/uninstall"));
 
@@ -164,12 +193,18 @@ fn install(quiet: bool) -> Result<Option<String>, String> {
     }
 
     // Окно держит свои файлы открытыми и после обновления было бы прежним.
-    // Без человека (обновление ставит служба) его не трогаем: запустить его
-    // заново из-под системы нечем. Его файл подменяется на ходу, а само оно,
-    // увидев службу новее себя, перезапускается.
-    if !quiet {
+    // С человеком оно закрывается и в конце открывается от его имени. Без
+    // человека (обновление ставит служба) — закрывается в тех сеансах, где
+    // его удастся открыть заново от имени пользователя сеанса, и
+    // открывается, когда установщик уходит (см. `Windows`). Само оно, увидев
+    // службу новее себя, перезапустилось бы и так — но окна прежних сборок
+    // до новой службы не достучатся.
+    let _windows = if quiet {
+        Windows::close(dir.join(UI))
+    } else {
         stop_processes(UI);
-    }
+        Windows::default()
+    };
     // Как служба запускалась до нас — чтобы вернуть, если новая не поднимется.
     let before = match &service {
         Some(service) => Some(service.command()?),
@@ -178,49 +213,29 @@ fn install(quiet: bool) -> Result<Option<String>, String> {
     if let Some(service) = &service {
         service.stop()?;
     }
-    std::fs::create_dir_all(&dir).map_err(|e| format!("папка {} не создалась: {e}", dir.display()))?;
-    sweep(&dir);
-    let kept = keep(&dir);
-    for (name, bytes) in payload::PAYLOAD {
-        place(&dir.join(name), bytes)?;
-    }
-    // Сам установщик — туда же: он же и удаляет программу.
-    if let Ok(me) = std::env::current_exe() {
-        let there = dir.join(SELF);
-        if !same_file(&me, &there) {
-            match std::fs::read(&me) {
-                Ok(bytes) => place(&there, &bytes)?,
-                Err(e) => return Err(format!("установщик не прочитал сам себя: {e}")),
-            }
-        }
-    }
-
+    // С этого места служба остановлена. Любая неудача дальше — запись
+    // файлов (антивирус держит библиотеку, кончилось место), путь службы,
+    // её запуск — не должна оставить её так: приложения из списка сидели бы
+    // без сети, причём молча, если обновление ставилось само, и поднять
+    // службу было бы некому. Поэтому неудача любого шага ведёт к одному и
+    // тому же откату.
+    let mut kept = Vec::new();
     let exe = dir.join(SVC);
-    match &service {
+    let outcome = replace_files(&dir, &mut kept).and_then(|()| match &service {
         // Служба есть: ей нужен только новый путь — и запуск.
         Some(service) => {
             service.point_to(&exe)?;
-            if let Err(reason) = service.start().and_then(|()| service.wait_running()) {
-                // Новая служба не поднялась. Оставить так — значит оставить
-                // приложения из списка без сети, причём молча, если
-                // обновление ставилось само. Возвращаем прежнюю.
-                let _ = service.stop();
-                let restored = restore(&dir, &kept);
-                if let Some(before) = &before {
-                    let _ = service.set_command(before);
-                }
-                let back = service.start().and_then(|()| service.wait_running()).is_ok();
-                return Err(format!(
-                    "новая служба не запустилась ({reason}); прежняя {}",
-                    match (restored || kept.is_empty(), back) {
-                        (true, true) => "возвращена и работает",
-                        _ => "не вернулась — запусти её: Start-Service vpnsplit",
-                    }
-                ));
-            }
+            service.start().and_then(|()| service.wait_running())
         }
         // Службы нет: создаёт её она сама, как умеет, со всеми настройками.
-        None => run(&exe, "install")?,
+        None => run(&exe, "install"),
+    });
+    if let Err(reason) = outcome {
+        return Err(match &service {
+            Some(service) => roll_back(service, &dir, &kept, before.as_deref(), &reason),
+            // Возвращать нечего: прежней службы не было.
+            None => reason,
+        });
     }
     register(&dir);
     // Окно — от имени человека, а не администратора: проводник запускает
@@ -235,6 +250,47 @@ fn install(quiet: bool) -> Result<Option<String>, String> {
          области уведомлений."
             .to_owned()
     }))
+}
+
+/// Кладёт новые файлы на место; прежние сперва откладываются в `previous`
+/// (их имена — в `kept`, даже если дальше что-то не вышло: по ним откат).
+fn replace_files(dir: &Path, kept: &mut Vec<&'static str>) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("папка {} не создалась: {e}", dir.display()))?;
+    sweep(dir);
+    *kept = keep(dir);
+    for (name, bytes) in payload::PAYLOAD {
+        place(&dir.join(name), bytes)?;
+    }
+    // Сам установщик — туда же: он же и удаляет программу.
+    if let Ok(me) = std::env::current_exe() {
+        let there = dir.join(SELF);
+        if !same_file(&me, &there) {
+            match std::fs::read(&me) {
+                Ok(bytes) => place(&there, &bytes)?,
+                Err(e) => return Err(format!("установщик не прочитал сам себя: {e}")),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Обновление не встало: вернуть прежние файлы, прежнюю строку запуска и
+/// запустить прежнюю службу. Возвращает текст ошибки — с тем, вернулась ли
+/// она.
+fn roll_back(service: &Service, dir: &Path, kept: &[&str], before: Option<&str>, reason: &str) -> String {
+    let _ = service.stop();
+    let restored = restore(dir, kept);
+    if let Some(before) = before {
+        let _ = service.set_command(before);
+    }
+    let back = service.start().and_then(|()| service.wait_running()).is_ok();
+    format!(
+        "обновление не встало ({reason}); прежняя служба {}",
+        match (restored || kept.is_empty(), back) {
+            (true, true) => "возвращена и работает",
+            _ => "не вернулась — запусти её: Start-Service vpnsplit",
+        }
+    )
 }
 
 fn remove(quiet: bool) -> Result<Option<String>, String> {
@@ -259,19 +315,34 @@ fn remove(quiet: bool) -> Result<Option<String>, String> {
             dir.display()
         ));
     }
+    // Занятое (библиотеку хуков держат приложения, запущенные через
+    // туннель, себя — мы сами) не удалить сейчас: это сделает Windows при
+    // следующей загрузке. Порядок пометок важен — Windows выполняет их по
+    // очереди, и папка удалится, только если к её очереди она уже пуста:
+    // поэтому сначала файлы, потом вложенные папки, потом она сама.
     for (name, _) in payload::PAYLOAD {
-        let _ = std::fs::remove_file(dir.join(name));
+        remove_or_later(&dir.join(name));
     }
     sweep(&dir);
-    for folder in ["previous", "update"] {
-        let _ = std::fs::remove_dir_all(dir.join(folder));
-    }
-    // Себя и папку, пока мы из неё работаем, не удалить: это сделает
-    // Windows при следующей загрузке.
-    for left in [dir.join(SELF), dir.clone()] {
-        if std::fs::remove_file(&left).is_err() && std::fs::remove_dir(&left).is_err() {
-            later(&left);
+    // Что `sweep` не смог убрать (отодвинутое прошлыми обновлениями и всё
+    // ещё занятое), — тоже на загрузку.
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            if is_moved_aside(&entry.path()) {
+                remove_or_later(&entry.path());
+            }
         }
+    }
+    // Журнал, который `note` мог завести здесь вместо каталога данных.
+    remove_or_later(&dir.join(LOG));
+    for folder in ["previous", "update"] {
+        remove_or_later(&dir.join(folder));
+    }
+    remove_or_later(&dir.join(SELF));
+    // Саму папку — только если в ней не осталось чужого: того, что положили
+    // туда не мы, удаление программы не касается.
+    if std::fs::remove_dir(&dir).is_err() && dir.is_dir() {
+        later(&dir);
     }
     unsafe {
         RegDeleteTreeW(HKEY_LOCAL_MACHINE, wide(UNINSTALL_KEY).as_ptr());
@@ -327,10 +398,19 @@ fn place(path: &Path, bytes: &[u8]) -> Result<(), String> {
         // а переименовать можно: она доработает под новым именем.
         let aside = path.with_extension(format!("old-{}-{attempt}", std::process::id()));
         if std::fs::rename(path, &aside).is_ok() {
-            later(&aside);
             if std::fs::write(path, bytes).is_ok() {
+                // На удаление при загрузке — только когда замена удалась:
+                // отменить такую пометку потом нечем.
+                later(&aside);
                 return Ok(());
             }
+            // Не записалось и под освободившимся именем — прежний файл
+            // возвращается на место: на месте файла не должно остаться
+            // пустоты. Не вернулся — остаётся в стороне как есть (его
+            // уберёт `sweep` следующей установки), а откат возьмёт копию
+            // из `previous`.
+            let _ = std::fs::remove_file(path);
+            let _ = std::fs::rename(&aside, path);
         }
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -362,34 +442,202 @@ fn restore(dir: &Path, kept: &[&str]) -> bool {
         })
 }
 
+/// Права каталога данных — те же, что ставит служба (`store::DATA_DIR_SDDL`
+/// в `vpnsplit-svc`): SYSTEM и администраторы — всё, пользователи — чтение.
+const DATA_DIR_SDDL: &str = "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FR;;;BU)";
+
 /// Строка в журнал установок: когда установщик работает без человека,
 /// больше ему сказать некуда.
+///
+/// Пишется в каталог данных, если ему можно верить, — так же, как решает
+/// служба: владелец SYSTEM или администраторы, права не унаследованы. Нет
+/// каталога (первая установка не дошла до запуска службы) — установщик
+/// заводит его сам, сразу с правами службы. Каталог, который завёл
+/// посторонний или который остался от прежних версий с унаследованными
+/// правами, служба при старте отложит в сторону; до тех пор строки в него
+/// не пишутся: его хозяин мог бы подменить его ссылкой, и установщик с
+/// правами администратора дописал бы строку в чужой файл. Тогда журнал
+/// пишется в папку установки, пока программа там стоит: в Program Files
+/// посторонний не пишет, а молчать нельзя — неудачное обновление без
+/// человека иначе не оставило бы никакого следа. Журнал, который сам ссылка
+/// или второе имя другого файла, не пишется нигде.
 fn note(text: &str) {
     use std::io::Write;
-    let Some(data) = std::env::var_os("ProgramData") else { return };
-    let dir = PathBuf::from(data).join("vpnsplit");
-    let _ = std::fs::create_dir_all(&dir);
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+    let data = std::env::var_os("ProgramData").map(|data| PathBuf::from(data).join("vpnsplit"));
+    let dir = match data {
+        Some(dir) if data_dir_trusted(&dir) => dir,
+        _ => match install_dir() {
+            Ok(dir) if dir.join(SVC).is_file() => dir,
+            _ => return,
+        },
+    };
     let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_secs())
         .unwrap_or_default();
-    if let Ok(mut log) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("setup.log")) {
+    let opened = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(dir.join(LOG));
+    let Ok(mut log) = opened else { return };
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ordinary = unsafe { GetFileInformationByHandle(log.as_raw_handle() as _, &mut info) } != 0
+        && info.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) == 0
+        && info.nNumberOfLinks == 1;
+    if ordinary {
         let _ = writeln!(log, "{seconds}  сборка {}: {text}", payload::BUILT.trim());
     }
+}
+
+/// Каталог данных есть и ему можно верить — или его не было, и он создан
+/// только что, с правами службы.
+fn data_dir_trusted(dir: &Path) -> bool {
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_ALREADY_EXISTS, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::{
+        GetSecurityDescriptorControl, IsWellKnownSid, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+        DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+        SE_DACL_PROTECTED,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateDirectoryW, CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        READ_CONTROL,
+    };
+
+    let path = wide(&dir.to_string_lossy());
+    unsafe {
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide(DATA_DIR_SDDL).as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        ) == 0
+        {
+            return false;
+        }
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        let created = CreateDirectoryW(path.as_ptr(), &attributes) != 0;
+        let code = GetLastError();
+        LocalFree(descriptor as _);
+        if created {
+            return true;
+        }
+        if code != ERROR_ALREADY_EXISTS {
+            return false;
+        }
+
+        // Сам каталог, а не то, куда он ведёт, если это ссылка.
+        let handle = CreateFileW(
+            path.as_ptr(),
+            READ_CONTROL,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        );
+        if handle == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+        let directory = GetFileInformationByHandle(handle, &mut info) != 0
+            && info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+            && info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut security: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        let read = GetSecurityInfo(
+            handle,
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut security,
+        ) == 0;
+        CloseHandle(handle);
+        if !read {
+            return false;
+        }
+        let mut control = 0u16;
+        let mut revision = 0u32;
+        let protected =
+            GetSecurityDescriptorControl(security, &mut control, &mut revision) != 0 && control & SE_DACL_PROTECTED != 0;
+        let admins = !owner.is_null()
+            && (IsWellKnownSid(owner, WinLocalSystemSid) != 0 || IsWellKnownSid(owner, WinBuiltinAdministratorsSid) != 0);
+        LocalFree(security as _);
+        directory && protected && admins
+    }
+}
+
+/// Файл, который прошлое обновление отодвинуло в сторону (`*.old-…`).
+fn is_moved_aside(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension.to_string_lossy().starts_with("old-"))
 }
 
 /// Убирает то, что прошлые обновления отодвинули в сторону.
 fn sweep(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
-        let old = entry
-            .path()
-            .extension()
-            .is_some_and(|extension| extension.to_string_lossy().starts_with("old-"));
-        if old {
+        if is_moved_aside(&entry.path()) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
+}
+
+/// Убирает файл или папку со всем, что в ней; что не удаляется сейчас
+/// (занято), помечается на удаление при загрузке — содержимое раньше
+/// папки. Нет такого — ничего не делает.
+fn remove_or_later(path: &Path) {
+    let Ok(meta) = std::fs::symlink_metadata(path) else { return };
+    // Ссылку убираем саму, не заходя туда, куда она ведёт.
+    if meta.is_dir() && !meta.file_type().is_symlink() {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                remove_or_later(&entry.path());
+            }
+        }
+        if std::fs::remove_dir(path).is_err() {
+            later(path);
+        }
+    } else if std::fs::remove_file(path).is_err() && std::fs::remove_dir(path).is_err() {
+        // Занятый файл сначала отодвигаем под своё имя и уже его помечаем на
+        // загрузку. Иначе пометка висит на прежнем имени, и если программу
+        // поставят снова до перезагрузки, Windows при загрузке сотрёт файлы
+        // новой установки. Занятый образ переименовать можно, удалить — нет.
+        // Не отодвинулся (открыт без FILE_SHARE_DELETE) — оставляем на месте
+        // без пометки, как было раньше: лишний файл лучше стёртой установки.
+        if let Some(aside) = move_aside(path) {
+            later(&aside);
+        }
+    }
+}
+
+/// Отодвигает файл под свободное имя `*.old-PID-N` рядом; None — не вышло.
+fn move_aside(path: &Path) -> Option<PathBuf> {
+    if is_moved_aside(path) {
+        return Some(path.to_path_buf());
+    }
+    (0..100).find_map(|attempt| {
+        let aside = path.with_extension(format!("old-{}-{attempt}", std::process::id()));
+        (!aside.exists() && std::fs::rename(path, &aside).is_ok()).then_some(aside)
+    })
 }
 
 /// Удалить при следующей загрузке Windows.
@@ -406,13 +654,13 @@ fn same_file(left: &Path, right: &Path) -> bool {
     }
 }
 
-/// Завершает все процессы с таким именем файла. Возвращает, были ли они.
-fn stop_processes(name: &str) -> bool {
-    let mut found = false;
+/// Номера процессов с таким именем файла, кроме нас самих.
+fn processes(name: &str) -> Vec<u32> {
+    let mut found = Vec::new();
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snapshot.is_null() || snapshot as isize == -1 {
-            return false;
+            return found;
         }
         let mut entry: PROCESSENTRY32W = std::mem::zeroed();
         entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
@@ -421,19 +669,344 @@ fn stop_processes(name: &str) -> bool {
             let length = entry.szExeFile.iter().position(|c| *c == 0).unwrap_or(entry.szExeFile.len());
             let image = String::from_utf16_lossy(&entry.szExeFile[..length]);
             if image.eq_ignore_ascii_case(name) && entry.th32ProcessID != std::process::id() {
-                let process = OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, entry.th32ProcessID);
-                if !process.is_null() {
-                    found = true;
-                    TerminateProcess(process, 0);
-                    WaitForSingleObject(process, 3000);
-                    CloseHandle(process);
-                }
+                found.push(entry.th32ProcessID);
             }
             more = Process32NextW(snapshot, &mut entry) != 0;
         }
         CloseHandle(snapshot);
     }
     found
+}
+
+fn session_of(pid: u32) -> Option<u32> {
+    let mut session = 0u32;
+    (unsafe { ProcessIdToSessionId(pid, &mut session) } != 0).then_some(session)
+}
+
+/// Полный путь к файлу процесса по его хэндлу (нужно право
+/// PROCESS_QUERY_LIMITED_INFORMATION); None — не узнать.
+fn image_of(process: HANDLE) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    let mut buffer = vec![0u16; 32768];
+    let mut length = buffer.len() as u32;
+    let ok = unsafe { QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut length) };
+    (ok != 0).then(|| PathBuf::from(std::ffi::OsString::from_wide(&buffer[..length as usize])))
+}
+
+/// Открытый хэндл процесса; закрывается сам.
+struct Process(HANDLE);
+
+impl Process {
+    /// Открывает процесс, чтобы проверить его файл, завершить и дождаться.
+    /// Пока хэндл открыт, номер процесса не достанется другому, даже если
+    /// этот завершится: что проверено, то и завершается.
+    fn open(pid: u32) -> Option<Self> {
+        let access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE;
+        let process = unsafe { OpenProcess(access, 0, pid) };
+        (!process.is_null()).then_some(Process(process))
+    }
+
+    /// Завершает процесс и ждёт, пока он уйдёт.
+    fn end(&self) {
+        unsafe {
+            TerminateProcess(self.0, 0);
+            WaitForSingleObject(self.0, 3000);
+        }
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// Один и тот же файл: пути в Windows сравниваются без учёта регистра, а
+/// если записаны по-разному (короткое имя, ссылка), решает сама файловая
+/// система.
+fn same_path(left: &Path, right: &Path) -> bool {
+    left.to_string_lossy().to_lowercase() == right.to_string_lossy().to_lowercase() || same_file(left, right)
+}
+
+/// Номера процессов после ключа [`SHOWN_FLAG`]; None — ключа нет, это
+/// обычный запуск установщика.
+fn shown_pids(args: &[String]) -> Option<Vec<u32>> {
+    let (first, rest) = args.split_first()?;
+    first
+        .eq_ignore_ascii_case(SHOWN_FLAG)
+        .then(|| rest.iter().filter_map(|pid| pid.parse().ok()).collect())
+}
+
+/// Есть ли у одного из процессов видимое окно верхнего уровня без
+/// владельца — главное окно, а не подсказка или окно сообщения. Видны
+/// только окна своего рабочего стола, поэтому работает это в сеансе
+/// пользователя, а не там, где служба (см. `shown_in`).
+fn any_shown(pids: &[u32]) -> bool {
+    struct Search<'a> {
+        pids: &'a [u32],
+        found: bool,
+    }
+    unsafe extern "system" fn each(hwnd: HWND, data: LPARAM) -> BOOL {
+        let search = &mut *(data as *mut Search);
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if search.pids.contains(&pid) && IsWindowVisible(hwnd) != 0 && GetWindow(hwnd, GW_OWNER).is_null() {
+            search.found = true;
+            return 0;
+        }
+        1
+    }
+    if pids.is_empty() {
+        return false;
+    }
+    let mut search = Search { pids, found: false };
+    unsafe { EnumWindows(Some(each), &mut search as *mut Search as LPARAM) };
+    search.found
+}
+
+/// Видно ли окно у этих процессов в сеансе `session`. Установщик без
+/// человека работает от имени SYSTEM в сеансе служб, а окна чужого сеанса
+/// оттуда не перечислить. Поэтому он запускает сам себя с [`SHOWN_FLAG`]
+/// на рабочем столе того сеанса — под своим же токеном с другим номером
+/// сеанса: от имени пользователя нельзя, файл установщика лежит в каталоге
+/// данных, где пользователям дано только чтение, без запуска. Любая
+/// неудача — «не видно»: окно уйдёт в трей, как и до этой проверки.
+fn shown_in(session: u32, pids: &[u32]) -> bool {
+    let Ok(me) = std::env::current_exe() else { return false };
+    let mut command = format!("\"{}\" {SHOWN_FLAG}", me.display());
+    for pid in pids {
+        command.push_str(&format!(" {pid}"));
+    }
+    let mut command = wide(&command);
+    let application = wide(&me.to_string_lossy());
+    let mut desktop = wide(r"winsta0\default");
+    unsafe {
+        let mut own: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_DUPLICATE, &mut own) == 0 {
+            return false;
+        }
+        let mut token: HANDLE = std::ptr::null_mut();
+        let duplicated = DuplicateTokenEx(
+            own,
+            TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID,
+            std::ptr::null(),
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut token,
+        ) != 0;
+        CloseHandle(own);
+        if !duplicated {
+            return false;
+        }
+        let moved = SetTokenInformation(
+            token,
+            TokenSessionId,
+            &session as *const u32 as *const std::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        ) != 0;
+        let mut startup: STARTUPINFOW = std::mem::zeroed();
+        startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+        startup.lpDesktop = desktop.as_mut_ptr();
+        // Без курсора «запускается программа» у человека: окна у нас нет.
+        startup.dwFlags = STARTF_FORCEOFFFEEDBACK;
+        let mut process: PROCESS_INFORMATION = std::mem::zeroed();
+        let started = moved
+            && CreateProcessAsUserW(
+                token,
+                application.as_ptr(),
+                command.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+                &startup,
+                &mut process,
+            ) != 0;
+        CloseHandle(token);
+        if !started {
+            return false;
+        }
+        CloseHandle(process.hThread);
+        let mut code = 0u32;
+        let answered = WaitForSingleObject(process.hProcess, SHOWN_PATIENCE_MS) == WAIT_OBJECT_0
+            && GetExitCodeProcess(process.hProcess, &mut code) != 0;
+        if !answered {
+            TerminateProcess(process.hProcess, 1);
+        }
+        CloseHandle(process.hProcess);
+        answered && code == SHOWN as u32
+    }
+}
+
+/// Окна, которые установщик без человека закрыл, чтобы открыть их заново из
+/// нового файла, — по сеансу на окно, с токеном пользователя этого сеанса.
+/// Открываются заново, когда установщик уходит (`Drop`), чем бы ни
+/// кончилась установка: окно, которое закрыли и не вернули, хуже прежнего.
+///
+/// Зачем закрывать. Обычно окно, увидев службу новее себя, перезапускается
+/// само. Но узнаёт оно это по каналу, а канал новой службы не пускает окна
+/// прежних сборок: они открывают его с правом, которого обычным
+/// пользователям больше не дают (см. `PIPE_SDDL` в `vpnsplit-net`). Такое
+/// окно осталось бы с «нет связи со службой» до выхода из системы.
+///
+/// Открыть окно в чужом сеансе можно только от имени SYSTEM — так
+/// установщик и запускается при обновлении, которое ставит служба. Если
+/// токен сеанса не дали (установщик запущен иначе), окно в этом сеансе не
+/// трогается вовсе.
+#[derive(Default)]
+struct Windows {
+    sessions: Vec<Session>,
+    exe: PathBuf,
+}
+
+/// Сеанс, где закрыто окно: токен его пользователя, закрытые процессы и
+/// было ли окно на виду.
+struct Session {
+    id: u32,
+    token: HANDLE,
+    /// Номера и хэндлы процессов окна. Хэндлы держатся до завершения:
+    /// проверка `shown_in` занимает секунды, и без них номер ушедшего за это
+    /// время процесса мог бы достаться чужому — тот и был бы завершён.
+    processes: Vec<(u32, Process)>,
+    shown: bool,
+}
+
+impl Windows {
+    /// Закрывает окна во всех сеансах, где потом сможет открыть их снова.
+    ///
+    /// Только установленные — файл которых и есть `exe`: копию из другой
+    /// папки (окно из папки сборки у разработчика) обновление не касается,
+    /// и подменять её установленной незачем.
+    ///
+    /// Окно, которое было на виду, откроется на виду, спрятанное в трей —
+    /// в трее (см. `shown_in`). Процесс завершается, а не закрывается сам,
+    /// поэтому свой значок в области уведомлений он не убирает: прежний
+    /// значок висит рядом с новым, пока на него не наведут мышь, — тогда
+    /// Windows видит, что хозяина нет, и убирает его. Это косметика, и с ней
+    /// мирится: попросить окно чужого сеанса закрыться самому отсюда нечем,
+    /// а окна прежних сборок ещё и не слушают новую службу.
+    fn close(exe: PathBuf) -> Self {
+        let mut windows = Windows { sessions: Vec::new(), exe };
+        for pid in processes(UI) {
+            // Сначала хэндл, потом проверки: номер, по которому смотрели файл
+            // и сеанс, уже не сменит хозяина до завершения.
+            let Some(process) = Process::open(pid) else { continue };
+            if !image_of(process.0).is_some_and(|image| same_path(&image, &windows.exe)) {
+                continue;
+            }
+            let Some(id) = session_of(pid).filter(|&session| session != 0) else { continue };
+            if let Some(session) = windows.sessions.iter_mut().find(|session| session.id == id) {
+                session.processes.push((pid, process));
+                continue;
+            }
+            let mut token: HANDLE = std::ptr::null_mut();
+            if unsafe { WTSQueryUserToken(id, &mut token) } == 0 {
+                continue;
+            }
+            windows.sessions.push(Session { id, token, processes: vec![(pid, process)], shown: false });
+        }
+        // Пока окна живы: после завершения смотреть уже не на что.
+        for session in &mut windows.sessions {
+            let pids: Vec<u32> = session.processes.iter().map(|(pid, _)| *pid).collect();
+            session.shown = shown_in(session.id, &pids);
+        }
+        // Завершаются те самые процессы, что проверены; хэндлы закрываются
+        // сразу — заново окна открываются по токену, не по ним.
+        for session in &mut windows.sessions {
+            for (_, process) in session.processes.drain(..) {
+                process.end();
+            }
+        }
+        windows
+    }
+}
+
+impl Drop for Windows {
+    fn drop(&mut self) {
+        for session in self.sessions.drain(..) {
+            if let Err(code) = start_as(session.token, &self.exe, session.shown) {
+                note(&format!("окно в сеансе {} заново не открылось (код {code})", session.id));
+            }
+            unsafe { CloseHandle(session.token) };
+        }
+    }
+}
+
+/// Строка запуска окна после обновления. `--after-update` — то же, с чем
+/// окно перезапускается само: оно не станет перезапускаться ещё раз, увидев
+/// службу новее себя. `--tray` — только если окно до обновления было
+/// спрятано: так же решает и само окно при своём перезапуске.
+fn window_command(exe: &Path, shown: bool) -> String {
+    let tray = if shown { "" } else { " --tray" };
+    format!("\"{}\" --after-update{tray}", exe.display())
+}
+
+/// Запускает окно от имени пользователя с этим токеном, на его рабочем
+/// столе и с его переменными окружения; `shown` — на виду, иначе значком в
+/// области уведомлений.
+fn start_as(token: HANDLE, exe: &Path, shown: bool) -> Result<(), u32> {
+    let mut environment: *mut std::ffi::c_void = std::ptr::null_mut();
+    if unsafe { CreateEnvironmentBlock(&mut environment, token, 0) } == 0 {
+        environment = std::ptr::null_mut();
+    }
+    let mut command = wide(&window_command(exe, shown));
+    let mut desktop = wide(r"winsta0\default");
+    let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    startup.lpDesktop = desktop.as_mut_ptr();
+    let mut process: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    let directory = exe.parent().map(|dir| wide(&dir.to_string_lossy()));
+    let started = unsafe {
+        CreateProcessAsUserW(
+            token,
+            std::ptr::null(),
+            command.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            CREATE_UNICODE_ENVIRONMENT,
+            environment,
+            directory.as_ref().map_or(std::ptr::null(), |dir| dir.as_ptr()),
+            &startup,
+            &mut process,
+        )
+    } != 0;
+    let code = unsafe { GetLastError() };
+    if !environment.is_null() {
+        unsafe { DestroyEnvironmentBlock(environment) };
+    }
+    if !started {
+        return Err(code);
+    }
+    unsafe {
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+    }
+    Ok(())
+}
+
+/// Завершает процессы и ждёт, пока они уйдут.
+fn terminate(pids: &[u32]) -> bool {
+    let mut found = false;
+    for &pid in pids {
+        unsafe {
+            let process = OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid);
+            if !process.is_null() {
+                found = true;
+                TerminateProcess(process, 0);
+                WaitForSingleObject(process, 3000);
+                CloseHandle(process);
+            }
+        }
+    }
+    found
+}
+
+/// Завершает все процессы с таким именем файла. Возвращает, были ли они.
+fn stop_processes(name: &str) -> bool {
+    terminate(&processes(name))
 }
 
 /// Запись в «Программах и компонентах»: оттуда программу удаляют.
@@ -628,8 +1201,19 @@ fn arguments_of(command: &str) -> &str {
             None => "",
         };
     }
-    // Без кавычек путь кончается на «.exe» — пробелы в нём возможны.
-    match command.to_lowercase().find(".exe") {
+    // Без кавычек путь кончается на «.exe», за которым пробел или конец
+    // строки, — пробелы в нём возможны, а «.exe» в середине имени папки
+    // (`C:\tools.exec\…`) концом не считается. Ищем по байтам без смены
+    // регистра: строчная форма не-ASCII букв бывает длиннее прописной, и
+    // позиция из `to_lowercase()` в исходной строке указала бы не туда, а то
+    // и в середину буквы. Срез после ASCII-байтов «.exe» — всегда на границе
+    // символа.
+    let bytes = command.as_bytes();
+    let end = (0..bytes.len().saturating_sub(3)).find(|&at| {
+        bytes[at..at + 4].eq_ignore_ascii_case(b".exe")
+            && bytes.get(at + 4).copied().unwrap_or(b' ').is_ascii_whitespace()
+    });
+    match end {
         Some(end) => &command[end + 4..],
         None => "",
     }
@@ -648,6 +1232,32 @@ mod tests {
         assert_eq!(arguments_of(""), "");
         // Незакрытая кавычка — не повод выдумывать доводы.
         assert_eq!(arguments_of(r#""C:\a\vpnsplit-svc.exe service"#), "");
+        // Буквы, у которых строчная форма длиннее прописной, позицию не сбивают.
+        assert_eq!(arguments_of(r"C:\İş\Ⱥ\vpnsplit-svc.exe service"), " service");
+        // «.exe» в имени папки — не конец пути.
+        assert_eq!(arguments_of(r"C:\tools.exec\vpnsplit-svc.exe service"), " service");
+        assert_eq!(arguments_of(r"C:\x.exe"), "");
+        assert_eq!(arguments_of("C:\\x.exe\tservice"), "\tservice");
+    }
+
+    #[test]
+    fn what_cannot_be_removed_now_is_left_for_the_reboot() {
+        // Свободное удаляется сразу и целиком, с вложенными папками.
+        let dir = std::env::temp_dir().join(format!("vpnsplit-setup-rm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("previous").join("inner")).unwrap();
+        std::fs::write(dir.join("previous").join("a.bin"), b"x").unwrap();
+        std::fs::write(dir.join("previous").join("inner").join("b.bin"), b"x").unwrap();
+        std::fs::write(dir.join("vpnsplit_hook.old-1-0"), b"x").unwrap();
+        remove_or_later(&dir.join("previous"));
+        assert!(!dir.join("previous").exists());
+        assert!(is_moved_aside(&dir.join("vpnsplit_hook.old-1-0")));
+        assert!(!is_moved_aside(&dir.join("vpnsplit_hook.dll")));
+        remove_or_later(&dir.join("vpnsplit_hook.old-1-0"));
+        assert!(!dir.join("vpnsplit_hook.old-1-0").exists());
+        // Того, чего нет, — нет и пометок.
+        remove_or_later(&dir.join("нет такого"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -676,6 +1286,42 @@ mod tests {
         assert!(same_file(&dir.join("vpnsplit_hook.dll"), &dir.join("vpnsplit_hook.dll")));
         assert!(!same_file(&dir.join("vpnsplit_hook.dll"), &dir.join("нет такого")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_the_installed_window_is_ours() {
+        let installed = Path::new(r"C:\Program Files\vpnsplit\vpnsplit-ui.exe");
+        assert!(same_path(Path::new(r"c:\program files\VPNSPLIT\vpnsplit-ui.exe"), installed));
+        assert!(same_path(
+            Path::new(r"C:\Программы\ВПН\vpnsplit-ui.exe"),
+            Path::new(r"C:\программы\впн\VPNSPLIT-UI.EXE")
+        ));
+        assert!(!same_path(Path::new(r"G:\src\vpnsplit\target\release\vpnsplit-ui.exe"), installed));
+    }
+
+    #[test]
+    fn the_window_comes_back_as_it_was() {
+        let exe = Path::new(r"C:\Program Files\vpnsplit\vpnsplit-ui.exe");
+        assert_eq!(window_command(exe, true), r#""C:\Program Files\vpnsplit\vpnsplit-ui.exe" --after-update"#);
+        assert_eq!(
+            window_command(exe, false),
+            r#""C:\Program Files\vpnsplit\vpnsplit-ui.exe" --after-update --tray"#
+        );
+    }
+
+    #[test]
+    fn the_visibility_question_is_told_apart_from_an_install() {
+        let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        assert_eq!(shown_pids(&args(&["/shown", "12", "345"])), Some(vec![12, 345]));
+        assert_eq!(shown_pids(&args(&["/SHOWN", "x", "7"])), Some(vec![7]));
+        assert_eq!(shown_pids(&args(&["/shown"])), Some(vec![]));
+        assert_eq!(shown_pids(&args(&["/quiet"])), None);
+        assert_eq!(shown_pids(&args(&["/quiet", "/shown"])), None);
+        assert_eq!(shown_pids(&args(&[])), None);
+        // Нет процессов — нет и окна; у несуществующего процесса — тоже.
+        assert!(!any_shown(&[]));
+        assert!(!any_shown(&[u32::MAX]));
+        assert_ne!(SHOWN, HIDDEN);
     }
 
     #[test]

@@ -58,6 +58,16 @@ const MANIFEST_HEAD: &str = "vpnsplit-update 1";
 /// Файл-отказ в каталоге данных: пока он есть, обновления не ищутся.
 const OPT_OUT: &str = "no-update";
 
+/// Отметка в каталоге данных: номер сборки, установщик которой служба
+/// запустила. Если служба потом всё ещё старее этой сборки, установка не
+/// удалась (новая служба не поднялась, и установщик вернул прежнюю, или он
+/// не смог её остановить). Такую сборку сама служба больше не ставит —
+/// иначе каждые несколько минут она останавливалась бы ради установки,
+/// которая снова откатится, и приложения из списка всякий раз теряли бы
+/// сеть. Поставить её всё равно можно по просьбе: `update now` или кнопка в
+/// окне. Сборка поновее ставится как обычно.
+const TRIED: &str = "update-tried";
+
 /// Первая проверка — не сразу: при запуске Windows сеть ещё поднимается, а
 /// службе есть чем заняться.
 const FIRST_CHECK: Duration = Duration::from_secs(180);
@@ -110,7 +120,7 @@ impl Manifest {
 
 fn unhex(text: &str) -> Option<Vec<u8>> {
     let text = text.trim();
-    if text.len() % 2 != 0 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !text.len().is_multiple_of(2) || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     (0..text.len()).step_by(2).map(|at| u8::from_str_radix(&text[at..at + 2], 16).ok()).collect()
@@ -342,9 +352,30 @@ pub fn describe(data: &Path) -> String {
     format!("сборка {BUILD}; {state}")
 }
 
+/// Сборка, которую служба уже пыталась поставить, — если та не встала.
+/// Отметка о сборке, которая не новее нашей, своё отслужила (установка
+/// удалась или вышло что-то ещё новее) и убирается.
+fn failed_build(store: &Store) -> Option<u64> {
+    let tried = store.load_text(TRIED).and_then(|text| text.trim().parse::<u64>().ok());
+    match tried {
+        Some(build) if newer(build) => Some(build),
+        _ => {
+            let _ = store.remove(TRIED);
+            None
+        }
+    }
+}
+
 /// Запускает поиск обновлений в своём потоке.
 pub fn start(store: Store) {
     store.log(&format!("обновления: {}", describe(store.dir())));
+    if BUILD != 0 {
+        if let Some(build) = failed_build(&store) {
+            store.log(&format!(
+                "обновления: сборка {build} не встала — сама больше не ставится, только по просьбе"
+            ));
+        }
+    }
     let Some(dir) = installed() else { return };
     if BUILD == 0 || MODULUS.is_empty() {
         return;
@@ -366,7 +397,7 @@ pub fn start(store: Store) {
                     store.log("обновления: выключены файлом no-update — не ищу");
                 }
             } else {
-                match check(&store, &dir) {
+                match check(&store, &dir, asked) {
                     Ok(found) => {
                         last_trouble.clear();
                         if asked && !found {
@@ -396,8 +427,9 @@ fn newer(build: u64) -> bool {
 }
 
 /// Одна проверка: есть ли выпуск новее, и если есть — поставить. Правда —
-/// нашёлся и установщик запущен.
-fn check(store: &Store, dir: &Path) -> Result<bool, String> {
+/// нашёлся и установщик запущен. `asked` — проверку попросил человек: ему
+/// ставится и сборка, которая однажды уже не встала.
+fn check(store: &Store, dir: &Path, asked: bool) -> Result<bool, String> {
     let manifest = fetch(MANIFEST, MANIFEST_LIMIT)?;
     let signature = fetch(SIGNATURE, SIGNATURE_LIMIT)?;
     if !verify(&manifest, &signature, MODULUS) {
@@ -406,6 +438,17 @@ fn check(store: &Store, dir: &Path) -> Result<bool, String> {
     let release = Manifest::parse(&manifest)?;
     if !newer(release.build) {
         return Ok(false);
+    }
+    if failed_build(store) == Some(release.build) {
+        if !asked {
+            // Сказано один раз при старте службы; каждые шесть часов
+            // повторять незачем.
+            return Ok(false);
+        }
+        store.log(&format!(
+            "обновления: сборка {} однажды уже не встала, но проверку попросили — ставлю снова",
+            release.build
+        ));
     }
     store.log(&format!(
         "обновления: есть сборка {} (версия {}), у нас {BUILD} — скачиваю",
@@ -425,6 +468,12 @@ fn check(store: &Store, dir: &Path) -> Result<bool, String> {
     if sha256(&written) != Some(release.sha256) {
         return Err("установщик на диске не совпал со скачанным — не ставлю".to_owned());
     }
+    // Отметка — до запуска: если установка откатится, вернувшаяся служба
+    // должна об этом знать. Не записалась — не ставим вовсе: без неё
+    // неудачная установка повторялась бы без конца.
+    store
+        .save_text(TRIED, &format!("{}\n", release.build))
+        .map_err(|e| format!("отметка о попытке обновления не записалась ({e}) — не ставлю"))?;
     store.log(&format!(
         "обновления: сборка {} проверена, запускаю установщик; служба сейчас остановится и \
          вернётся новой",
@@ -434,7 +483,12 @@ fn check(store: &Store, dir: &Path) -> Result<bool, String> {
         .arg("/quiet")
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
-        .map_err(|e| format!("установщик не запустился: {e}"))?;
+        .map_err(|e| {
+            // Установщик даже не запустился — служба не останавливалась, и
+            // через шесть часов эту сборку можно попробовать снова.
+            let _ = store.remove(TRIED);
+            format!("установщик не запустился: {e}")
+        })?;
     Ok(true)
 }
 
@@ -508,6 +562,27 @@ mod tests {
         assert!(Manifest::parse(text.replace(SHA, "abcd").as_bytes()).is_err());
         assert!(Manifest::parse(format!("{text}run=calc.exe\n").as_bytes()).is_err());
         assert!(Manifest::parse(&[0xff, 0xfe, 0x00]).is_err());
+    }
+
+    #[test]
+    fn a_build_that_did_not_install_is_remembered_until_ours_catches_up() {
+        let dir = std::env::temp_dir().join(format!("vpnsplit-update-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::scratch(dir.clone());
+        assert_eq!(failed_build(&store), None, "отметки нет");
+        let later = BUILD + 5;
+        store.save_text(TRIED, &format!("{later}\n")).unwrap();
+        assert_eq!(failed_build(&store), Some(later), "сборка новее нашей — не встала");
+        assert!(dir.join(TRIED).is_file());
+        // Наша сборка не старее отмеченной — отметка своё отслужила.
+        store.save_text(TRIED, &format!("{BUILD}\n")).unwrap();
+        assert_eq!(failed_build(&store), None);
+        assert!(!dir.join(TRIED).exists());
+        store.save_text(TRIED, "не число").unwrap();
+        assert_eq!(failed_build(&store), None);
+        assert!(!dir.join(TRIED).exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
