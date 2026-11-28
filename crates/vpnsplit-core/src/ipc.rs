@@ -114,6 +114,12 @@ impl Request {
     /// маршрут на время, и звать это любой программе вошедшего пользователя
     /// нельзя.
     ///
+    /// Правка списка без прав — не правка чего угодно: правила на чужие
+    /// программы (системные, из Store для всех, из профилей других
+    /// пользователей) служба от обычного клиента не примет. Это решается
+    /// по содержимому политики, а не по виду запроса, и потому не здесь, а
+    /// в обработчике `SetPolicy`.
+    ///
     /// Перечислено без «прочее»: новый запрос не скомпилируется, пока его
     /// не отнесут к одной из сторон.
     pub fn privileged(&self) -> bool {
@@ -121,6 +127,10 @@ impl Request {
             Request::GetStatus | Request::GetPolicy | Request::SetPolicy(_) | Request::Subscribe => {
                 false
             }
+            // Забыть все подключения разом — в том числе те, что завёл
+            // администратор и через которые идут чужие приложения. Окно
+            // удаляет подключения по одному, по имени.
+            Request::ClearVpnConfig { name: None } => true,
             // Конфиг выбирают в окне, а окно работает без повышения прав.
             // Цена этого решения — в том, что служба запускает OpenVPN под
             // SYSTEM по тексту от обычного пользователя, и уплачена она
@@ -256,6 +266,12 @@ pub struct TunnelInfo {
     /// туннелирование фактически не работает. Пользователь должен это видеть.
     #[serde(default)]
     pub captures_all: bool,
+    /// DNS, который сервер VPN назначил этому подключению. Пусто — не
+    /// знаем (туннель чужой или сервер DNS не назначил). Лончер передаёт
+    /// его hook.dll в `VPNSPLIT_DNS`: многие VPN режут порт 53 к публичным
+    /// резолверам, а внутренние имена знает только этот сервер.
+    #[serde(default)]
+    pub dns: Vec<Ipv4Addr>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -481,6 +497,7 @@ mod tests {
             name: "OpenVPN TAP-Windows6".to_owned(),
             ipv4: Some(Ipv4Addr::new(10, 5, 5, 2)),
             captures_all: false,
+            dns: Vec::new(),
         })
     }
 
@@ -553,6 +570,20 @@ mod tests {
         let text = r#"{"Up":{"index":8,"name":"tap","ipv4":"10.5.5.2"}}"#;
         let state: TunnelState = serde_json::from_str(text).unwrap();
         assert!(!state.info().unwrap().captures_all);
+        // Старая служба DNS подключения не присылает — лончер просто не
+        // кладёт его в окружение.
+        assert!(state.info().unwrap().dns.is_empty());
+    }
+
+    #[test]
+    fn tunnel_dns_survives_the_pipe() {
+        let mut state = up();
+        if let TunnelState::Up(info) = &mut state {
+            info.dns = vec![Ipv4Addr::new(10, 8, 0, 1)];
+        }
+        let text = serde_json::to_string(&state).unwrap();
+        let back: TunnelState = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, state);
     }
 
     #[test]
@@ -575,6 +606,7 @@ mod tests {
         }
         // Всё, что трогает чужой трафик, — только администратору.
         for closed in [
+            Request::ClearVpnConfig { name: None },
             Request::CheckKillswitch(PathBuf::from(r"C:\app.exe")),
             Request::ProbeDivert { seconds: 1 },
             Request::ProbeFlows { seconds: 1 },

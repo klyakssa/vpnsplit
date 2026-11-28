@@ -9,6 +9,7 @@ mod probe;
 mod procs;
 mod redirect;
 mod reroute;
+mod rights;
 mod service;
 mod store;
 mod udpprobe;
@@ -108,7 +109,8 @@ fn print_help() {
     println!("                   пока не скажут (конфиг остаётся)");
     println!("  vpn default ИМЯ  вести через него приложения, которым подключение не выбрано");
     println!("  vpn login ИМЯ    сменить логин и пароль подключения");
-    println!("  vpn off [ИМЯ]    забыть подключение и опустить его; без имени — все");
+    println!("  vpn off [ИМЯ]    забыть подключение и опустить его; без имени — все (нужен");
+    println!("                   администратор: среди них могут быть и чужие подключения)");
     println!("  vpn check ФАЙЛ   ничего не меняя: что из конфига дойдёт до OpenVPN, примет ли он");
     println!("                   его и подходит ли пароль ключа (сервер при этом не тревожится)");
     println!("  vpn              что со своими подключениями сейчас");
@@ -780,7 +782,7 @@ fn show_tree(needle: Option<&String>) -> Result<(), String> {
     let by_pid: HashMap<u32, &(u32, u32, String)> = all.iter().map(|e| (e.0, e)).collect();
     let needle = needle.map(|s| s.to_lowercase());
 
-    println!("{:>7} {:>7}  {:<28} {}", "процесс", "родитель", "образ", "пакет");
+    println!("{:>7} {:>7}  {:<28} пакет", "процесс", "родитель", "образ");
     let mut shown = 0usize;
     for (pid, parent, name) in &all {
         // Показываем либо то, что просили, либо всё, у чего есть пакет, и
@@ -948,8 +950,11 @@ fn edit_policy(what: Option<&String>, add: bool, family: bool) -> Result<(), Str
     };
     let before = policy.rules.len();
     // Одно правило на приложение: добавить второй раз — значит заменить,
-    // в том числе сменить путь A на путь B.
-    policy.rules.retain(|r| r.target != target);
+    // в том числе сменить путь A на путь B. Сравнение — по ключу, без
+    // учёта регистра, как и везде в службе: два написания одного пути —
+    // одно приложение, а не два правила.
+    let key = target.key();
+    policy.rules.retain(|r| r.target.key() != key);
     if add {
         policy.rules.push(if family {
             AppRule::tunnel_family(target.clone())

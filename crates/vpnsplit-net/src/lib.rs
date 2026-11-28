@@ -11,6 +11,7 @@ pub mod ipv4;
 pub mod pipe;
 pub mod proc;
 pub mod routes;
+pub mod stall;
 pub mod tcptable;
 pub mod udptable;
 pub mod watch;
