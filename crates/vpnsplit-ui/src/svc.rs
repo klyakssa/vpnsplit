@@ -2,8 +2,10 @@
 //! синхронный, и запрос к занятой службе подвесил бы интерфейс. Рабочий
 //! поток кладёт результат в сообщение окна, окно просто его разбирает.
 
+use std::io::Read;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::{ChildStderr, Stdio};
 use vpnsplit_core::{
     AppTarget, Event, Login, Policy, Request, Response, Secret, Status, VpnAction,
 };
@@ -309,28 +311,106 @@ pub fn launch_now(path: &Path) -> Result<String, String> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| path.to_string_lossy().into_owned());
 
+    // Ждём выход самого лончера, а не конец его stderr: конец наступит,
+    // только когда закроются все копии канала. Лончер своему приложению канал
+    // не передаёт, но если копия где-то всё же осталась, окно не должно
+    // висеть до закрытия браузера. Поэтому stderr читает отдельный поток,
+    // а мы после выхода лончера ждём его недолго.
+    //
+    // Поток заводим до лончера: если создать его не выйдет, лончер получит
+    // NUL вместо канала. Канал без читателя хуже: его закрытый конец
+    // превращает следующий eprintln! лончера в панику, и уже запущенное
+    // с хуками приложение окно назвало бы незапущенным.
+    let (pipe_tx, pipe_rx) = std::sync::mpsc::channel::<ChildStderr>();
+    let (text_tx, text_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::Builder::new()
+        .name("launch-stderr".into())
+        .spawn(move || {
+            if let Ok(stderr) = pipe_rx.recv() {
+                let _ = text_tx.send(read_tail(stderr));
+            }
+        });
+    let stderr = if reader.is_ok() { Stdio::piped() } else { Stdio::null() };
+
     // --no-wait: лончер ставит хуки, отпускает приложение и выходит сам.
     // Иначе он жил бы ровно столько, сколько запущенная программа.
-    let output = std::process::Command::new(&launcher)
+    // --detach-stdio: наш канал stderr приложению не передаётся (вместо него
+    // NUL), иначе его конец наступил бы только с закрытием браузера. Лончер
+    // ставится вместе с окном, поэтому этот ключ он знает.
+    let mut child = std::process::Command::new(&launcher)
         .arg("--no-wait")
+        .arg("--detach-stdio")
         .arg("--")
         .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(stderr)
         .creation_flags(CREATE_NO_WINDOW)
-        .output();
+        .spawn()
+        .map_err(|e| format!("не удалось запустить лончер: {e}"))?;
 
-    match output {
-        Ok(out) if out.status.success() => Ok(name),
-        Ok(out) => {
-            let text = String::from_utf8_lossy(&out.stderr);
-            let reason = text
-                .lines()
-                .rev()
-                .find(|line| !line.trim().is_empty())
-                .unwrap_or("лончер не объяснил причину")
-                .trim()
-                .to_owned();
-            Err(format!("{name} не запущен: {reason}"))
+    // Если поток почему-то уже не принимает канал, держим его открытым сами
+    // до выхода лончера — по той же причине, что выше.
+    let unread = child.stderr.take().and_then(|stderr| pipe_tx.send(stderr).err());
+    let status = child.wait().map_err(|e| format!("лончер: не дождались выхода: {e}"));
+    drop(unread);
+    if status?.success() {
+        return Ok(name);
+    }
+    let text = text_rx.recv_timeout(STDERR_GRACE).unwrap_or_default();
+    Err(format!("{name} не запущен: {}", last_line(&text)))
+}
+
+/// Сколько ждать остаток stderr после выхода лончера.
+const STDERR_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+/// Сколько хвоста stderr держать: причина отказа — последняя строка.
+const STDERR_KEEP: usize = 16 * 1024;
+
+/// Читает поток до конца, оставляя только последние [`STDERR_KEEP`] байт.
+/// Дочитывать до конца нужно, иначе лончер мог бы встать на записи.
+fn read_tail(mut input: impl Read) -> String {
+    let mut tail: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match input.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                tail.extend_from_slice(&chunk[..n]);
+                if tail.len() > STDERR_KEEP {
+                    tail.drain(..tail.len() - STDERR_KEEP);
+                }
+            }
         }
-        Err(e) => Err(format!("не удалось запустить лончер: {e}")),
+    }
+    String::from_utf8_lossy(&tail).into_owned()
+}
+
+/// Последняя непустая строка — то, чем лончер объясняет отказ.
+fn last_line(text: &str) -> String {
+    text.lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("лончер не объяснил причину")
+        .trim()
+        .to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tail_keeps_only_the_end() {
+        let mut input = vec![b'x'; STDERR_KEEP * 3];
+        input.extend_from_slice("\nпоследняя строка\n".as_bytes());
+        let text = read_tail(input.as_slice());
+        assert!(text.len() <= STDERR_KEEP);
+        assert_eq!(last_line(&text), "последняя строка");
+    }
+
+    #[test]
+    fn last_line_skips_blanks_and_explains_silence() {
+        assert_eq!(last_line("туннель: x\nотказ: нет прав\n\n  \n"), "отказ: нет прав");
+        assert_eq!(last_line(""), "лончер не объяснил причину");
     }
 }

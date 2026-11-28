@@ -10,8 +10,11 @@ use crate::svc::{self, Reply, Target};
 use crate::tray::{self, Tray};
 use crate::win::{self, rgb, scale, wide};
 use crate::{apps, ask};
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use vpnsplit_core::{
     ovpn, AppRule, AppTarget, Event, Mechanism, Policy, Routing, TunnelState, VpnAction, VpnState,
 };
@@ -33,7 +36,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
     DestroyWindow, GetClientRect, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
-    IsWindowVisible, MessageBoxW, PostMessageW, PostQuitMessage, SendMessageW,
+    IsWindowVisible, MessageBoxW, PostQuitMessage, SendMessageW,
     SetForegroundWindow, SetWindowLongPtrW,
     RegisterWindowMessageW, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX,
     SetWindowPos, SetWindowTextW, ShowWindow, TrackPopupMenu, BS_PUSHBUTTON, CREATESTRUCTW,
@@ -117,10 +120,40 @@ const LVN_ITEMCHANGED_CODE: u32 = (-101i32) as u32;
 
 pub const CLASS_NAME: &str = "vpnsplit.ui.main";
 
-/// Окно уже перезапускалось после обновления (ключ `--after-update`).
-/// Второй раз подряд оно этого не делает: если его файл почему-то остался
-/// прежним, перезапуски шли бы по кругу.
-pub static AFTER_UPDATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// На какую сборку службы окно уже перезапускалось (ключ `--after-update
+/// N`); ноль — ни на какую. На ту же сборку второй раз оно этого не делает:
+/// если его файл почему-то остался прежним, перезапуски шли бы по кругу. А
+/// на следующую — делает: прежний флаг «уже перезапускалось» жил до конца
+/// процесса, и окно, однажды перезапущенное, все следующие обновления
+/// пропускало.
+pub static RESTARTED_FOR: AtomicU64 = AtomicU64::new(0);
+
+/// Окно запустило прежнее, которое номера сборки не передаёт (`--after-update`
+/// без числа): на какую сборку был перезапуск, неизвестно. Первая же
+/// увиденная сборка службы считается ею.
+pub const RESTARTED_FOR_UNKNOWN: u64 = u64::MAX;
+
+/// Что делать с окном, увидев сборку службы.
+#[derive(Debug, PartialEq, Eq)]
+enum Restart {
+    No,
+    /// Не перезапускаться, но запомнить эту сборку как уже пройденную.
+    Remember(u64),
+    Now,
+}
+
+/// `own` — сборка окна (0 — собрано без номера), `service` — службы,
+/// `done` — на какую уже перезапускались.
+fn restart_plan(own: u64, service: u64, done: u64) -> Restart {
+    if done == RESTARTED_FOR_UNKNOWN {
+        return Restart::Remember(service);
+    }
+    if own != 0 && service > own && service > done {
+        Restart::Now
+    } else {
+        Restart::No
+    }
+}
 
 pub struct App {
     hwnd: HWND,
@@ -200,6 +233,150 @@ pub struct App {
     /// Конфиг, отправленный службе с паролем ключа: на «не подошёл» пароль
     /// спрашивается ещё раз, а выбирать файл заново незачем.
     pending: Option<svc::VpnOrder>,
+    /// Пора уходить: «Выход» в меню значка или перезапуск после
+    /// обновления. Само окно уничтожается не там, где это решено, а когда
+    /// обработчик вернулся (`Shell::settle`): на стеке не должно остаться
+    /// ни одного кадра, который ещё работает с окном.
+    leaving: bool,
+    /// Последний список правил от службы, пришедший, пока обработчик
+    /// держал `App` и ждал человека (выбор файла, меню, вопрос). Сам ответ
+    /// встаёт в очередь `Shell` и разбирается после обработчика — но
+    /// обработчик успеет отправить службе список, собранный из
+    /// `self.policy` до модального окна, и вернёт этим убранное за это
+    /// время правило. Поэтому перед сохранением он берёт отсюда свежее
+    /// (`catch_up_policy`). Общий с `Shell`: вложенный вызов `App` не видит.
+    newest_policy: Rc<RefCell<Option<Policy>>>,
+}
+
+/// Окно и всё, что ему нужно, когда `App` занят.
+///
+/// Обработчики окна открывают модальные окна: вопросы, сообщения, меню,
+/// выбор файла. Их собственный цикл сообщений снова зовёт оконную
+/// процедуру, пока внешний обработчик держит `App`. Раньше вложенный вызов
+/// брал второй `&mut App` поверх живого первого: ответ службы, пришедший
+/// во время вопроса, подменял список правил под ссылкой внешнего кадра, а
+/// «Выход» из меню значка освобождал `App` прямо из-под него. Теперь `App`
+/// лежит в `RefCell`: вложенный вызов его не получает, а то, что пришло
+/// за это время, откладывается и разбирается, когда внешний вернётся.
+/// Освобождает `Shell` не окно, а `main` — после выхода из цикла сообщений.
+pub struct Shell {
+    app: RefCell<App>,
+    /// Пришедшее, пока `App` был занят, — по порядку прихода.
+    later: RefCell<VecDeque<Later>>,
+    /// Чем красить надписи и какой наименьший размер окна, — то, что
+    /// нужно и вложенному вызову. Обновляется после каждого обработчика.
+    look: Cell<Look>,
+    /// Отложенные перерисовки: повторять их по числу пропущенных сообщений
+    /// незачем, достаточно знать, что они нужны.
+    relayout: Cell<bool>,
+    buttons: Cell<bool>,
+    repaint: Cell<bool>,
+    taskbar: Cell<bool>,
+    dpi: Cell<Option<u32>>,
+    /// Окно уничтожено: отложенное уже некому показывать.
+    gone: Cell<bool>,
+    /// То же, что `App::newest_policy`.
+    newest_policy: Rc<RefCell<Option<Policy>>>,
+}
+
+/// То, что пришло, пока `App` был занят.
+enum Later {
+    Event(Box<Event>),
+    Reply(Box<Reply>),
+    Link(bool),
+    Exit,
+}
+
+#[derive(Clone, Copy)]
+struct Look {
+    list: HWND,
+    warn: HWND,
+    vpn_note: HWND,
+    hint: HWND,
+    back: HBRUSH,
+    hint_error: bool,
+    dpi: u32,
+}
+
+impl Shell {
+    /// Создаётся до окна и отдаётся в `CreateWindowExW`; поле `hwnd` у
+    /// `App` заполняется в WM_NCCREATE, когда окно уже есть.
+    pub fn new() -> Box<Shell> {
+        let app = App::pending();
+        let look = app.look();
+        let newest_policy = Rc::clone(&app.newest_policy);
+        Box::new(Shell {
+            app: RefCell::new(app),
+            later: RefCell::new(VecDeque::new()),
+            look: Cell::new(look),
+            relayout: Cell::new(false),
+            buttons: Cell::new(false),
+            repaint: Cell::new(false),
+            taskbar: Cell::new(false),
+            dpi: Cell::new(None),
+            gone: Cell::new(false),
+            newest_policy,
+        })
+    }
+
+    /// Окна больше нет: снять значок и отдать то, что создали мы. Зовёт
+    /// `main`, когда цикл сообщений закончился и ни одного обработчика на
+    /// стеке не осталось.
+    pub fn finish(&self) {
+        if let Ok(mut app) = self.app.try_borrow_mut() {
+            app.destroy();
+        }
+    }
+
+    fn postpone(&self, later: Later) {
+        self.later.borrow_mut().push_back(later);
+    }
+
+    /// Разобрать отложенное. Зовётся, когда обработчик верхнего уровня
+    /// вернул `App`; то, что придёт, пока разбирается отложенное (оно тоже
+    /// может спросить человека), встаёт в ту же очередь и разбирается здесь
+    /// же.
+    fn settle(&self) {
+        loop {
+            if self.gone.get() {
+                self.later.borrow_mut().clear();
+                return;
+            }
+            let Ok(mut app) = self.app.try_borrow_mut() else { return };
+            if app.leaving {
+                app.leave();
+                continue;
+            }
+            if let Some(dpi) = self.dpi.take() {
+                app.dpi = dpi;
+                app.make_fonts();
+                self.relayout.set(true);
+            }
+            if self.taskbar.replace(false) {
+                app.on_taskbar_created();
+            }
+            if self.relayout.replace(false) {
+                app.layout();
+            }
+            if self.buttons.replace(false) {
+                app.update_buttons();
+            }
+            if self.repaint.replace(false) {
+                // Строки таблицы и подсказка, нарисованные во время
+                // модального окна, красились без знания о состоянии.
+                unsafe {
+                    InvalidateRect(app.list, std::ptr::null(), 1);
+                    InvalidateRect(app.hint, std::ptr::null(), 1);
+                }
+            }
+            self.look.set(app.look());
+            let next = self.later.borrow_mut().pop_front();
+            match next {
+                Some(later) => app.run_later(later),
+                None => return,
+            }
+        }
+    }
 }
 
 /// Что показывать в колонке состояния.
@@ -214,10 +391,8 @@ enum Mark {
 }
 
 impl App {
-    /// Создаётся до окна и отдаётся в `CreateWindowExW` — поле `hwnd`
-    /// заполняется в WM_NCCREATE, когда окно уже есть.
-    pub fn pending() -> Box<App> {
-        Box::new(App {
+    fn pending() -> App {
+        App {
             hwnd: std::ptr::null_mut(),
             dpi: 96,
             font: std::ptr::null_mut(),
@@ -256,7 +431,51 @@ impl App {
             titles: HashMap::new(),
             titles_loaded: false,
             pending: None,
-        })
+            leaving: false,
+            newest_policy: Rc::new(RefCell::new(None)),
+        }
+    }
+
+    fn look(&self) -> Look {
+        Look {
+            list: self.list,
+            warn: self.warn,
+            vpn_note: self.vpn_note,
+            hint: self.hint,
+            back: self.back,
+            hint_error: self.hint_error,
+            dpi: self.dpi,
+        }
+    }
+
+    fn run_later(&mut self, later: Later) {
+        match later {
+            Later::Event(event) => self.on_event(*event),
+            Later::Reply(reply) => self.on_reply(*reply),
+            Later::Link(linked) => self.on_link(linked),
+            Later::Exit => self.leaving = true,
+        }
+    }
+
+    /// Взять список правил, пришедший, пока обработчик ждал человека.
+    /// Зовётся после модального окна и до того, как из `self.policy`
+    /// собирается сохраняемый список.
+    fn catch_up_policy(&mut self) {
+        let newest = self.newest_policy.borrow_mut().take();
+        if let Some(policy) = newest {
+            self.policy = policy;
+            self.refresh_list();
+        }
+    }
+
+    /// Уйти: снять значок, пока окно живо (по нему значок и снимается), и
+    /// уничтожить окно. Зовётся только из `Shell::settle`, когда на стеке
+    /// нет обработчиков, которым окно ещё нужно.
+    fn leave(&mut self) {
+        // Сброс до DestroyWindow: если оно не удастся, по кругу не пойдём.
+        self.leaving = false;
+        self.tray.remove();
+        unsafe { DestroyWindow(self.hwnd) };
     }
 
     fn build(&mut self) {
@@ -667,17 +886,35 @@ impl App {
         self.win_icon = fresh;
     }
 
+    /// Годится ли выбранная строка для лончера.
+    ///
+    /// Кнопка запуска и ярлык — это лончер, то есть хуки пути A. Правилу
+    /// «приложение и все его потомки» они не нужны: такое приложение
+    /// запускают как обычно, и уводит его перехват. Оставь мы кнопку
+    /// живой, она ставила бы хуки в приложение, которое и так ведётся, —
+    /// два способа сразу, и уже не понять, который из них сработал.
+    /// Ровно это и случилось при первой же живой проверке.
+    fn runnable(&self) -> bool {
+        list::selected(self.list)
+            .and_then(|row| self.policy.rules.get(row))
+            .is_some_and(|rule| {
+                matches!(rule.target, AppTarget::Executable(_)) && rule.mechanism() == Mechanism::Inject
+            })
+    }
+
+    /// Можно ли запустить выбранное через лончер прямо сейчас. Одно условие
+    /// и для кнопки, и для двойного щелчка по строке: иначе щелчок обходил бы
+    /// всё, из-за чего кнопка серая.
+    fn can_run(&self) -> bool {
+        // Туннеля нет — лончер всё равно откажется, и честнее показать
+        // это недоступной кнопкой, а не ошибкой после щелчка.
+        let up = matches!(self.tunnel, TunnelState::Up(_));
+        self.linked && up && self.runnable()
+    }
+
     fn update_buttons(&self) {
         let chosen = list::selected(self.list).and_then(|row| self.policy.rules.get(row));
-        // Кнопка запуска и ярлык — это лончер, то есть хуки пути A. Правилу
-        // «приложение и все его потомки» они не нужны: такое приложение
-        // запускают как обычно, и уводит его перехват. Оставь мы кнопку
-        // живой, она ставила бы хуки в приложение, которое и так ведётся, —
-        // два способа сразу, и уже не понять, который из них сработал.
-        // Ровно это и случилось при первой же живой проверке.
-        let runnable = chosen.is_some_and(|rule| {
-            matches!(rule.target, AppTarget::Executable(_)) && rule.mechanism() == Mechanism::Inject
-        });
+        let runnable = self.runnable();
         unsafe {
             EnableWindow(self.add, self.linked as i32);
             EnableWindow(self.store, self.linked as i32);
@@ -690,10 +927,7 @@ impl App {
             // Ярлык делается и при опущенном туннеле: это просто файл на
             // рабочем столе, туннель понадобится потом, при запуске.
             EnableWindow(self.shortcut, runnable as i32);
-            // Туннеля нет — лончер всё равно откажется, и честнее показать
-            // это недоступной кнопкой, а не ошибкой после щелчка.
-            let up = matches!(self.tunnel, TunnelState::Up(_));
-            EnableWindow(self.run, (self.linked && runnable && up) as i32);
+            EnableWindow(self.run, self.can_run() as i32);
         }
     }
 
@@ -880,13 +1114,10 @@ impl App {
             IDC_DEL => self.remove_app(),
             IDC_RUN => self.run_app(),
             IDC_SHORTCUT => self.make_shortcut(),
-            tray::ID_OPEN => unsafe {
-                ShowWindow(self.hwnd, SW_RESTORE);
-                SetForegroundWindow(self.hwnd);
-            },
-            tray::ID_EXIT => unsafe {
-                DestroyWindow(self.hwnd);
-            },
+            // «Открыть окно» разбирает сама оконная процедура: ему `App` не
+            // нужен, и работать оно должно и при открытом вопросе.
+            // Уничтожается окно не здесь, а когда обработчик вернётся.
+            tray::ID_EXIT => self.leaving = true,
             _ => {}
         }
     }
@@ -903,6 +1134,12 @@ impl App {
             // хуже отсутствующего.
             return;
         };
+        // Пока висели выбор файла и вопрос, список мог смениться.
+        self.catch_up_policy();
+        if self.policy.rules.iter().any(|rule| rule.target == target) {
+            self.set_hint(&format!("{} уже в списке", target.display_name()), false);
+            return;
+        }
         let mut policy = self.policy.clone();
         policy.rules.push(if family {
             AppRule::tunnel_family(target)
@@ -940,8 +1177,15 @@ impl App {
         if !self.confirm_store(&family) {
             return;
         }
+        // Пока висели меню и вопрос, список мог смениться.
+        self.catch_up_policy();
+        let target = AppTarget::Package(family.clone());
+        if self.policy.rules.iter().any(|rule| rule.target == target) {
+            self.set_hint(&format!("пакет {family} уже в списке"), false);
+            return;
+        }
         let mut policy = self.policy.clone();
-        policy.rules.push(AppRule::tunnel_family(AppTarget::Package(family.clone())));
+        policy.rules.push(AppRule::tunnel_family(target));
         self.set_hint(&format!("добавляю пакет {family}…"), false);
         svc::save_policy(Target::new(self.hwnd), policy);
     }
@@ -1063,6 +1307,12 @@ impl App {
     /// заданных — подменю: подключить и отключить, сделать подключением по
     /// умолчанию, сменить логин, забыть.
     fn vpn_menu(&mut self) {
+        // Номер строки меню — номер подключения в том списке, по которому
+        // меню построено. Действие ищет подключение по имени из этого
+        // снимка, а не по номеру в `self.vpns`: служба могла переставить
+        // подключения, и «Отключить» досталось бы другому.
+        let names: Vec<String> =
+            self.vpns.iter().take(VPN_MENU_LIMIT).map(|vpn| vpn.name.clone()).collect();
         let chosen = unsafe {
             let menu = CreatePopupMenu();
             if menu.is_null() {
@@ -1144,7 +1394,11 @@ impl App {
         }
         let Some(offset) = chosen.checked_sub(ID_VPN_ITEM_FIRST) else { return };
         let (index, what) = (offset as usize / VPN_ITEM_STEP, offset as usize % VPN_ITEM_STEP);
-        let Some(name) = self.vpns.get(index).map(|vpn| vpn.name.clone()) else { return };
+        let Some(name) = names.get(index).cloned() else { return };
+        if !self.vpns.iter().any(|vpn| vpn.name == name) {
+            // Пока меню было открыто, подключение забыли.
+            return;
+        }
         let target = Target::new(self.hwnd);
         match what {
             VPN_ITEM_CONNECT => {
@@ -1364,7 +1618,13 @@ impl App {
     fn lane_menu(&mut self) {
         let Some(row) = list::selected(self.list) else { return };
         let Some(rule) = self.policy.rules.get(row) else { return };
+        // Снимок до меню: правило — по тому, что оно ведёт, подключения — по
+        // именам. После меню номер строки таблицы и номер подключения могли
+        // означать уже другое.
+        let target = rule.target.clone();
         let current = rule.vpn.clone();
+        let names: Vec<String> =
+            self.vpns.iter().take(VPN_MENU_LIMIT).map(|vpn| vpn.name.clone()).collect();
         let check = |on: bool| if on { MF_STRING | MF_CHECKED } else { MF_STRING };
         let chosen = unsafe {
             let menu = CreatePopupMenu();
@@ -1415,14 +1675,14 @@ impl App {
         let vpn = match chosen {
             ID_LANE_DEFAULT => None,
             id if (ID_LANE_FIRST..ID_LANE_FIRST + VPN_MENU_LIMIT as u32).contains(&id) => {
-                match self.vpns.get((id - ID_LANE_FIRST) as usize) {
-                    Some(vpn) => Some(vpn.name.clone()),
-                    None => return,
+                match names.get((id - ID_LANE_FIRST) as usize) {
+                    Some(name) if self.vpns.iter().any(|vpn| vpn.name == *name) => Some(name.clone()),
+                    _ => return,
                 }
             }
             _ => return,
         };
-        self.set_lane(row, vpn);
+        self.set_lane(&target, vpn);
     }
 
     /// Назначить правилу подключение.
@@ -1430,14 +1690,22 @@ impl App {
     /// Выбирать подключение умеет только перехват (путь B): хук пути A
     /// привязывает сокеты к одному туннелю на всех. Поэтому правило пути A
     /// при выборе подключения становится правилом пути B — с согласия.
-    fn set_lane(&mut self, row: usize, vpn: Option<String>) {
-        let Some(rule) = self.policy.rules.get(row) else { return };
+    ///
+    /// Правило ищется по тому, что оно ведёт, а не по номеру строки, и
+    /// заново после вопроса: ссылку на правило через модальное окно не
+    /// держим — пока оно открыто, список мог смениться.
+    fn set_lane(&mut self, target: &AppTarget, vpn: Option<String>) {
+        // Пока было открыто меню «Куда…», список мог смениться.
+        self.catch_up_policy();
+        let Some(rule) = self.policy.rules.iter().find(|rule| rule.target == *target) else {
+            return;
+        };
         if rule.vpn == vpn {
             return;
         }
         let name = self.shown_name(&rule.target);
-        let mut fresh = rule.clone();
-        if vpn.is_some() && rule.mechanism() != Mechanism::Divert {
+        let convert = vpn.is_some() && rule.mechanism() != Mechanism::Divert;
+        if convert {
             let text = format!(
                 "Выбрать подключение можно только тому, что ведётся перехватом: {name} будет \
                  вестись вместе со всеми программами, которые запустит, — как бы его ни \
@@ -1455,11 +1723,17 @@ impl App {
             if answer != IDOK {
                 return;
             }
-            fresh = AppRule::tunnel_family(rule.target.clone());
         }
-        fresh.vpn = vpn.clone();
+        self.catch_up_policy();
         let mut policy = self.policy.clone();
-        policy.rules[row] = fresh;
+        let Some(rule) = policy.rules.iter_mut().find(|rule| rule.target == *target) else {
+            // Правило убрали, пока висел вопрос.
+            return;
+        };
+        if convert && rule.mechanism() != Mechanism::Divert {
+            *rule = AppRule::tunnel_family(target.clone());
+        }
+        rule.vpn = vpn.clone();
         let hint = match &vpn {
             Some(vpn) => format!("{name}: через «{vpn}»…"),
             None => format!("{name}: через подключение по умолчанию…"),
@@ -1519,6 +1793,10 @@ impl App {
     }
 
     fn run_app(&mut self) {
+        // Двойной щелчок приходит сюда и тогда, когда кнопка выключена.
+        if !self.can_run() {
+            return;
+        }
         let Some(row) = list::selected(self.list) else { return };
         let Some(rule) = self.policy.rules.get(row) else { return };
         let target = rule.target.clone();
@@ -1637,9 +1915,11 @@ impl App {
                 // Служба новее окна — значит, обновление уже поставлено и
                 // файл окна подменён: пора стать новым и самому.
                 self.divert_error = status.divert_error.clone();
-                let newer = vpnsplit_core::BUILD != 0 && status.build > vpnsplit_core::BUILD;
-                if newer && !AFTER_UPDATE.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                    self.restart_updated();
+                let done = RESTARTED_FOR.load(Ordering::Acquire);
+                match restart_plan(vpnsplit_core::BUILD, status.build, done) {
+                    Restart::Now => self.restart_updated(status.build),
+                    Restart::Remember(build) => RESTARTED_FOR.store(build, Ordering::Release),
+                    Restart::No => {}
                 }
                 if self.divert != status.divert_active || self.supervised != status.supervised {
                     self.divert = status.divert_active;
@@ -1728,28 +2008,22 @@ impl App {
 
     /// Запускает себя заново — уже из обновлённого файла — и уходит. Если
     /// окно было спрятано, новое тоже останется значком.
-    fn restart_updated(&mut self) {
+    /// `build` — сборка службы: новое окно узнает по ней, что на эту сборку
+    /// перезапуск уже был.
+    fn restart_updated(&mut self, build: u64) {
         let Ok(exe) = std::env::current_exe() else { return };
         let mut fresh = std::process::Command::new(exe);
-        fresh.arg("--after-update");
+        fresh.arg("--after-update").arg(build.to_string());
         if unsafe { IsWindowVisible(self.hwnd) } == 0 {
             fresh.arg(crate::autostart::TRAY_FLAG);
         }
+        // Сборка запоминается только после удачного запуска: не вышло —
+        // попробуем на следующем ответе службы.
         if fresh.spawn().is_ok() {
-            // Выход — тем же путём, что «Выход» в меню значка, и не из этого
-            // вызова: окно ещё занято ответом службы.
-            unsafe { PostMessageW(self.hwnd, WM_COMMAND, tray::ID_EXIT as usize, 0) };
-        }
-    }
-
-    fn on_tray(&mut self, mouse: u32) {
-        match mouse {
-            WM_RBUTTONUP => tray::menu(self.hwnd),
-            WM_LBUTTONUP | WM_LBUTTONDBLCLK => unsafe {
-                ShowWindow(self.hwnd, SW_RESTORE);
-                SetForegroundWindow(self.hwnd);
-            },
-            _ => {}
+            RESTARTED_FOR.store(build, Ordering::Release);
+            // Выход — тем же путём, что «Выход» в меню значка: окно
+            // уничтожится, когда этот обработчик вернётся.
+            self.leaving = true;
         }
     }
 
@@ -2059,8 +2333,44 @@ fn taskbar_created() -> u32 {
     *NUMBER.get_or_init(|| unsafe { RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()) })
 }
 
-fn app_of(hwnd: HWND) -> *mut App {
-    unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App }
+fn shell_of(hwnd: HWND) -> *const Shell {
+    unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Shell }
+}
+
+/// Поднять окно из трея. `App` для этого не нужен.
+fn show_window(hwnd: HWND) {
+    unsafe {
+        ShowWindow(hwnd, SW_RESTORE);
+        SetForegroundWindow(hwnd);
+    }
+}
+
+/// Щелчок по значку в трее.
+fn tray_click(hwnd: HWND, mouse: u32) {
+    match mouse {
+        WM_RBUTTONUP => tray::menu(hwnd),
+        WM_LBUTTONUP | WM_LBUTTONDBLCLK => show_window(hwnd),
+        _ => {}
+    }
+}
+
+/// Сообщения, которым нужен `App`. Остальные разбираются без него, и
+/// прежде всего `DefWindowProcW`: перетаскивание и растягивание окна — его
+/// собственный модальный цикл, и держи мы на это время `App`, все WM_SIZE
+/// и перерисовки таблицы внутри него стали бы «вложенными».
+fn needs_app(message: u32) -> bool {
+    message == taskbar_created()
+        || matches!(
+            message,
+            WM_CREATE
+                | WM_SIZE
+                | WM_DPICHANGED
+                | WM_COMMAND
+                | WM_NOTIFY
+                | svc::WM_EVENT
+                | svc::WM_LINK
+                | svc::WM_REPLY
+        )
 }
 
 pub unsafe extern "system" fn wndproc(
@@ -2071,73 +2381,45 @@ pub unsafe extern "system" fn wndproc(
 ) -> LRESULT {
     if message == WM_NCCREATE {
         let create = lparam as *const CREATESTRUCTW;
-        let app = (*create).lpCreateParams as *mut App;
-        if !app.is_null() {
-            (*app).hwnd = hwnd;
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, app as isize);
+        let shell = (*create).lpCreateParams as *const Shell;
+        if !shell.is_null() {
+            if let Ok(mut app) = (*shell).app.try_borrow_mut() {
+                app.hwnd = hwnd;
+            }
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, shell as isize);
         }
         return DefWindowProcW(hwnd, message, wparam, lparam);
     }
 
-    let app = app_of(hwnd);
-    if app.is_null() {
+    let shell = shell_of(hwnd);
+    if shell.is_null() {
         return DefWindowProcW(hwnd, message, wparam, lparam);
     }
-    let app = &mut *app;
+    // Shell живёт до выхода из цикла сообщений в `main`, то есть дольше
+    // окна; общая ссылка на него безопасна и во вложенном вызове.
+    let shell = &*shell;
 
-    // Номер этого сообщения Windows выдаёт по имени, в `match` его не
-    // поставить.
-    if message == taskbar_created() {
-        app.on_taskbar_created();
-        return 0;
-    }
-
+    // Без App.
     match message {
-        WM_CREATE => {
-            app.build();
-            0
-        }
-        WM_SIZE => {
-            app.layout();
-            0
-        }
-        WM_GETMINMAXINFO => {
-            let info = lparam as *mut MINMAXINFO;
-            if !info.is_null() {
-                (*info).ptMinTrackSize.x = scale(840, app.dpi);
-                (*info).ptMinTrackSize.y = scale(400, app.dpi);
-            }
-            0
-        }
-        WM_DPICHANGED => {
-            app.dpi = (wparam & 0xFFFF) as u32;
-            app.make_fonts();
-            let suggested = lparam as *const RECT;
-            if !suggested.is_null() {
-                let r = &*suggested;
-                SetWindowPos(
-                    hwnd,
-                    std::ptr::null_mut(),
-                    r.left,
-                    r.top,
-                    r.right - r.left,
-                    r.bottom - r.top,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-            }
-            app.layout();
-            0
-        }
         WM_CTLCOLORSTATIC => {
+            let look = shell.look.get();
+            if look.back.is_null() {
+                return DefWindowProcW(hwnd, message, wparam, lparam);
+            }
+            if shell.app.try_borrow_mut().is_err() {
+                // Красим по снимку, который мог отстать от подсказки:
+                // перерисуем, когда App освободится.
+                shell.repaint.set(true);
+            }
             let control = lparam as HWND;
             let dc = wparam as HDC;
             SetBkColor(dc, GetSysColor(COLOR_WINDOW));
-            let color = if control == app.warn {
+            let color = if control == look.warn {
                 rgb(154, 103, 0)
-            } else if control == app.vpn_note {
+            } else if control == look.vpn_note {
                 rgb(96, 100, 106)
-            } else if control == app.hint {
-                if app.hint_error {
+            } else if control == look.hint {
+                if look.hint_error {
                     rgb(192, 40, 35)
                 } else {
                     rgb(96, 100, 106)
@@ -2146,44 +2428,24 @@ pub unsafe extern "system" fn wndproc(
                 rgb(20, 22, 26)
             };
             SetTextColor(dc, color);
-            app.back as LRESULT
+            return look.back as LRESULT;
         }
-        WM_COMMAND => {
-            app.on_command((wparam & 0xFFFF) as u32);
-            0
-        }
-        WM_NOTIFY => {
-            let header = lparam as *const NMHDR;
-            if header.is_null() || (*header).hwndFrom != app.list {
-                return 0;
+        WM_GETMINMAXINFO => {
+            let info = lparam as *mut MINMAXINFO;
+            if !info.is_null() {
+                let dpi = shell.look.get().dpi;
+                (*info).ptMinTrackSize.x = scale(840, dpi);
+                (*info).ptMinTrackSize.y = scale(400, dpi);
             }
-            match (*header).code {
-                NM_DBLCLK_CODE => app.run_app(),
-                LVN_ITEMCHANGED_CODE => app.update_buttons(),
-                NM_CUSTOMDRAW_CODE => return app.paint_row(lparam as *mut NMLVCUSTOMDRAW),
-                _ => {}
-            }
-            0
-        }
-        svc::WM_EVENT => {
-            if let Some(event) = svc::take::<Event>(lparam) {
-                app.on_event(*event);
-            }
-            0
-        }
-        svc::WM_LINK => {
-            app.on_link(wparam != 0);
-            0
-        }
-        svc::WM_REPLY => {
-            if let Some(reply) = svc::take::<Reply>(lparam) {
-                app.on_reply(*reply);
-            }
-            0
+            return 0;
         }
         svc::WM_TRAY => {
-            app.on_tray((lparam as u32) & 0xFFFF);
-            0
+            tray_click(hwnd, (lparam as u32) & 0xFFFF);
+            return 0;
+        }
+        WM_COMMAND if (wparam & 0xFFFF) as u32 == tray::ID_OPEN => {
+            show_window(hwnd);
+            return 0;
         }
         WM_CLOSE => {
             // Крестик прячет окно, а программа остаётся значком в области
@@ -2192,24 +2454,220 @@ pub unsafe extern "system" fn wndproc(
             // только запустив программу заново (замечено пользователем
             // 23.11.2026). Выход — пунктом «Выход» в меню значка.
             ShowWindow(hwnd, SW_HIDE);
-            0
+            return 0;
         }
         WM_DESTROY => {
-            app.destroy();
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-            drop(Box::from_raw(app as *mut App));
+            // App здесь не освобождается: WM_DESTROY приходит изнутри
+            // DestroyWindow, то есть пока обработчик, который его позвал,
+            // ещё на стеке. Освобождает всё `main`, когда цикл кончится.
+            shell.gone.set(true);
             PostQuitMessage(0);
-            0
+            return 0;
         }
-        _ => DefWindowProcW(hwnd, message, wparam, lparam),
+        _ => {}
+    }
+    if !needs_app(message) {
+        return DefWindowProcW(hwnd, message, wparam, lparam);
+    }
+
+    if message == WM_DPICHANGED {
+        // Оба пути двигают окно по предложенному прямоугольнику, а
+        // SetWindowPos тут же спрашивает WM_GETMINMAXINFO — наименьший
+        // размер должен быть уже для нового DPI, иначе окно, переехавшее на
+        // монитор с меньшим масштабом, упрётся в старый минимум.
+        let mut look = shell.look.get();
+        look.dpi = (wparam & 0xFFFF) as u32;
+        shell.look.set(look);
+    }
+    let Ok(mut app) = shell.app.try_borrow_mut() else {
+        return while_busy(shell, hwnd, message, wparam, lparam);
+    };
+    // Списки правил, запомненные во время прошлых обработчиков, уже
+    // разобраны из очереди в `settle`; новому обработчику они только
+    // подсунули бы старое.
+    shell.newest_policy.borrow_mut().take();
+    let result = app.handle(hwnd, message, wparam, lparam);
+    drop(app);
+    shell.settle();
+    result
+}
+
+/// Сообщение пришло, пока `App` занят внешним обработчиком (он открыл
+/// модальное окно или послал сообщение сам себе). Ничего из `App` здесь
+/// не трогается: что нужно сделать — откладывается до `Shell::settle`.
+unsafe fn while_busy(
+    shell: &Shell,
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if message == taskbar_created() {
+        shell.taskbar.set(true);
+        return 0;
+    }
+    match message {
+        WM_SIZE => shell.relayout.set(true),
+        WM_DPICHANGED => {
+            shell.dpi.set(Some((wparam & 0xFFFF) as u32));
+            move_to_suggested(hwnd, lparam);
+        }
+        // Кнопки, пока открыто модальное окно, не нажать: окно выключено.
+        // Откладывать стоит только выход — иначе «Выход» из меню значка во
+        // время вопроса потерялся бы.
+        WM_COMMAND if (wparam & 0xFFFF) as u32 == tray::ID_EXIT => shell.postpone(Later::Exit),
+        WM_NOTIFY => {
+            let header = lparam as *const NMHDR;
+            if header.is_null() || (*header).hwndFrom != shell.look.get().list {
+                return 0;
+            }
+            match (*header).code {
+                LVN_ITEMCHANGED_CODE => shell.buttons.set(true),
+                NM_CUSTOMDRAW_CODE => {
+                    // Строку рисуем как есть, а красим потом — по состоянию.
+                    shell.repaint.set(true);
+                    return CDRF_DODEFAULT as LRESULT;
+                }
+                // Двойной щелчок во время вопроса ничего не запускает.
+                _ => {}
+            }
+        }
+        svc::WM_EVENT => {
+            if let Some(event) = svc::take::<Event>(lparam) {
+                if let Event::PolicyChanged(policy) = &*event {
+                    *shell.newest_policy.borrow_mut() = Some(policy.clone());
+                }
+                shell.postpone(Later::Event(event));
+            }
+        }
+        svc::WM_LINK => shell.postpone(Later::Link(wparam != 0)),
+        svc::WM_REPLY => {
+            if let Some(reply) = svc::take::<Reply>(lparam) {
+                if let Reply::Policy(policy) = &*reply {
+                    *shell.newest_policy.borrow_mut() = Some(policy.clone());
+                }
+                shell.postpone(Later::Reply(reply));
+            }
+        }
+        _ => {}
+    }
+    0
+}
+
+/// WM_DPICHANGED: Windows предлагает новый прямоугольник окна.
+unsafe fn move_to_suggested(hwnd: HWND, lparam: LPARAM) {
+    let suggested = lparam as *const RECT;
+    if !suggested.is_null() {
+        let r = &*suggested;
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            r.left,
+            r.top,
+            r.right - r.left,
+            r.bottom - r.top,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+impl App {
+    /// Сообщения, которым нужен `App` (`needs_app`), — на верхнем уровне.
+    unsafe fn handle(&mut self, hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        // Номер этого сообщения Windows выдаёт по имени, в `match` его не
+        // поставить.
+        if message == taskbar_created() {
+            self.on_taskbar_created();
+            return 0;
+        }
+        match message {
+            WM_CREATE => {
+                self.build();
+                0
+            }
+            WM_SIZE => {
+                self.layout();
+                0
+            }
+            WM_DPICHANGED => {
+                self.dpi = (wparam & 0xFFFF) as u32;
+                self.make_fonts();
+                move_to_suggested(hwnd, lparam);
+                self.layout();
+                0
+            }
+            WM_COMMAND => {
+                self.on_command((wparam & 0xFFFF) as u32);
+                0
+            }
+            WM_NOTIFY => {
+                let header = lparam as *const NMHDR;
+                if header.is_null() || (*header).hwndFrom != self.list {
+                    return 0;
+                }
+                match (*header).code {
+                    NM_DBLCLK_CODE => self.run_app(),
+                    LVN_ITEMCHANGED_CODE => self.update_buttons(),
+                    NM_CUSTOMDRAW_CODE => return self.paint_row(lparam as *mut NMLVCUSTOMDRAW),
+                    _ => {}
+                }
+                0
+            }
+            svc::WM_EVENT => {
+                if let Some(event) = svc::take::<Event>(lparam) {
+                    self.on_event(*event);
+                }
+                0
+            }
+            svc::WM_LINK => {
+                self.on_link(wparam != 0);
+                0
+            }
+            svc::WM_REPLY => {
+                if let Some(reply) = svc::take::<Reply>(lparam) {
+                    self.on_reply(*reply);
+                }
+                0
+            }
+            _ => DefWindowProcW(hwnd, message, wparam, lparam),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{divert_state, short, store_choices, under};
+    use super::{
+        divert_state, restart_plan, short, store_choices, under, Restart, RESTARTED_FOR_UNKNOWN,
+    };
     use std::path::Path;
     use vpnsplit_core::AppTarget;
+
+    #[test]
+    fn a_newer_service_restarts_the_window() {
+        assert_eq!(restart_plan(10, 11, 0), Restart::Now);
+        assert_eq!(restart_plan(10, 10, 0), Restart::No);
+        assert_eq!(restart_plan(10, 9, 0), Restart::No);
+    }
+
+    #[test]
+    fn the_same_build_does_not_restart_twice_but_the_next_one_does() {
+        // Окно перезапустилось на 11, а файл почему-то остался 10: по кругу
+        // не ходим.
+        assert_eq!(restart_plan(10, 11, 11), Restart::No);
+        // Пришла 12 — перезапуск снова нужен: раньше флаг «уже было» жил
+        // до конца процесса и его не пускал.
+        assert_eq!(restart_plan(11, 12, 11), Restart::Now);
+    }
+
+    #[test]
+    fn a_window_built_without_a_number_never_restarts() {
+        assert_eq!(restart_plan(0, 11, 0), Restart::No);
+    }
+
+    #[test]
+    fn an_unknown_restart_remembers_the_first_seen_build() {
+        assert_eq!(restart_plan(10, 11, RESTARTED_FOR_UNKNOWN), Restart::Remember(11));
+    }
 
     fn running(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs.iter().map(|(name, family)| (name.to_string(), family.to_string())).collect()

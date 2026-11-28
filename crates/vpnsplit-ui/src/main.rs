@@ -38,6 +38,14 @@ fn run_argument(args: &[String]) -> Option<String> {
     None
 }
 
+/// Сборка службы, на которую нас перезапустило прежнее окно: `--after-update
+/// N`. `Some(None)` — ключ есть, а номера нет (так запускает окно прежних
+/// версий); `None` — ключа нет.
+fn after_update(args: &[String]) -> Option<Option<u64>> {
+    let at = args.iter().position(|argument| argument == "--after-update")?;
+    Some(args.get(at + 1).and_then(|number| number.parse().ok()))
+}
+
 use win::wide;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::{
@@ -65,8 +73,9 @@ fn main() {
 
     // Нас запустило прежнее окно после обновления: дождаться, пока оно
     // уйдёт, иначе мы примем его за «уже открытое» и уйдём сами.
-    if args.iter().any(|argument| argument == "--after-update") {
-        window::AFTER_UPDATE.store(true, std::sync::atomic::Ordering::Release);
+    if let Some(build) = after_update(&args) {
+        let done = build.unwrap_or(window::RESTARTED_FOR_UNKNOWN);
+        window::RESTARTED_FOR.store(done, std::sync::atomic::Ordering::Release);
         for _ in 0..50 {
             let old = unsafe { FindWindowW(wide(window::CLASS_NAME).as_ptr(), std::ptr::null()) };
             if old.is_null() {
@@ -134,8 +143,11 @@ fn main() {
         return;
     }
 
-    // Окно получает App в lpParam и забирает его себе; освобождает — WM_DESTROY.
-    let app = Box::into_raw(window::App::pending());
+    // Окно получает Shell в lpParam и пользуется им, пока живо. Освобождается
+    // он здесь, после цикла сообщений: окно уничтожается изнутри своего же
+    // обработчика, и освободи оно Shell в WM_DESTROY, обработчики выше по
+    // стеку остались бы с освобождённой памятью.
+    let shell = Box::into_raw(window::Shell::new());
     let hwnd = unsafe {
         CreateWindowExW(
             0,
@@ -149,11 +161,11 @@ fn main() {
             std::ptr::null_mut(),
             std::ptr::null_mut(),
             instance as _,
-            app as *const _,
+            shell as *const _,
         )
     };
     if hwnd.is_null() {
-        drop(unsafe { Box::from_raw(app) });
+        drop(unsafe { Box::from_raw(shell) });
         win::error_box(std::ptr::null_mut(), "не удалось создать окно");
         return;
     }
@@ -201,5 +213,36 @@ fn main() {
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+    }
+    // Окна уже нет (или цикл оборвался ошибкой — тогда уходим и так), и ни
+    // одного обработчика на стеке.
+    let shell = unsafe { Box::from_raw(shell) };
+    shell.finish();
+    drop(shell);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::after_update;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|argument| argument.to_string()).collect()
+    }
+
+    #[test]
+    fn the_build_comes_after_the_key() {
+        assert_eq!(after_update(&args(&["--after-update", "42"])), Some(Some(42)));
+        assert_eq!(after_update(&args(&["--after-update", "42", "--tray"])), Some(Some(42)));
+    }
+
+    #[test]
+    fn an_old_window_passes_no_number() {
+        assert_eq!(after_update(&args(&["--after-update"])), Some(None));
+        assert_eq!(after_update(&args(&["--after-update", "--tray"])), Some(None));
+    }
+
+    #[test]
+    fn without_the_key_there_was_no_restart() {
+        assert_eq!(after_update(&args(&["--tray"])), None);
     }
 }

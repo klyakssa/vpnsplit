@@ -65,7 +65,18 @@ pub fn dot(kind: Dot, size: i32) -> HICON {
         let mask: HBITMAP = CreateBitmap(size, size, 1, 1, std::ptr::null());
         (color, mask)
     };
-    if color.is_null() || bits.is_null() {
+    if color.is_null() || bits.is_null() || mask.is_null() {
+        // Что успело создаться, удаляется и здесь: значок рисуется при каждой
+        // смене состояния, и на нехватке GDI каждая неудача теряла бы ещё
+        // растр, приближая отказ всего остального.
+        unsafe {
+            if !color.is_null() {
+                DeleteObject(color as _);
+            }
+            if !mask.is_null() {
+                DeleteObject(mask as _);
+            }
+        }
         return std::ptr::null_mut();
     }
 
