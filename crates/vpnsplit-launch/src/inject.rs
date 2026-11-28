@@ -7,10 +7,17 @@
 
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
-use vpnsplit_core::hook::INIT_EXPORT;
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
-use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, SetHandleInformation, GENERIC_READ, GENERIC_WRITE, HANDLE, HANDLE_FLAG_INHERIT,
+    INVALID_HANDLE_VALUE,
+};
+use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, GetFileType, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_PIPE, OPEN_EXISTING,
+};
+use windows_sys::Win32::System::Console::{
+    GetStdHandle, STD_ERROR_HANDLE, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+};
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, GetExitCodeProcess, ResumeThread, TerminateProcess, WaitForSingleObject,
     CREATE_SUSPENDED, INFINITE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
@@ -89,9 +96,9 @@ fn quote(arg: &str) -> String {
     out
 }
 
-pub fn launch(program: &str, args: &[String], dll: &Path, ifindex: u32) -> Result<Launched, String> {
-    let init_offset = local_export_offset(dll)?;
-
+/// `detach_stdio` (`--detach-stdio`) — каналы (pipe) своих стандартных
+/// потоков приложению не передавать, см. [`std_handle`].
+pub fn launch(program: &str, args: &[String], dll: &Path, ifindex: u32, detach_stdio: bool) -> Result<Launched, String> {
     let mut cmdline: Vec<u16> = command_line(program, args)
         .encode_utf16()
         .chain(std::iter::once(0))
@@ -103,11 +110,10 @@ pub fn launch(program: &str, args: &[String], dll: &Path, ifindex: u32) -> Resul
     // подцепится к консоли, а GUI-приложение (браузер) без этого останется
     // без stdout: всё, что оно печатает, уйдёт в никуда.
     startup.dwFlags = STARTF_USESTDHANDLES;
-    unsafe {
-        startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-        startup.hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE);
-        startup.hStdError = GetStdHandle(STD_ERROR_HANDLE);
-    }
+    let mut nul = None;
+    startup.hStdInput = std_handle(STD_INPUT_HANDLE, detach_stdio, &mut nul);
+    startup.hStdOutput = std_handle(STD_OUTPUT_HANDLE, detach_stdio, &mut nul);
+    startup.hStdError = std_handle(STD_ERROR_HANDLE, detach_stdio, &mut nul);
     let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
     let created = unsafe {
@@ -130,7 +136,10 @@ pub fn launch(program: &str, args: &[String], dll: &Path, ifindex: u32) -> Resul
     let main_thread = Handle(info.hThread);
     let launched = Launched { process: info.hProcess, pid: info.dwProcessId };
 
-    match vpnsplit_inject::inject(launched.process, dll, init_offset, ifindex) {
+    // Своя копия NUL больше не нужна: у приложения — своя, унаследованная.
+    drop(nul);
+
+    match vpnsplit_inject::inject(launched.process, dll, ifindex) {
         Ok(()) => {
             unsafe { ResumeThread(main_thread.0) };
             Ok(launched)
@@ -142,17 +151,55 @@ pub fn launch(program: &str, args: &[String], dll: &Path, ifindex: u32) -> Resul
     }
 }
 
-/// Смещение экспорта инициализации от начала образа. Считается на локальной
-/// копии DLL: DllMain в ней ничего не делает, поэтому загружать её безопасно.
-fn local_export_offset(dll: &Path) -> Result<usize, String> {
-    let module = unsafe { LoadLibraryW(wide(dll.as_os_str()).as_ptr()) };
-    if module.is_null() {
-        return Err(format!("не удалось загрузить {} локально", dll.display()));
+/// Стандартный поток для приложения.
+///
+/// Без `detach` передаём свой как есть: `vpnsplit-launch -- tool.exe | tee`
+/// из консоли получает вывод приложения. С `detach` канал (pipe) не
+/// передаём: его читает тот, кто запустил лончер (окно vpnsplit), и ждёт
+/// конца данных. Пока копия пишущего конца живёт в приложении и всех его
+/// потомках, конец не наступит — окно ждало бы закрытия браузера, а не
+/// лончера. Вместо канала приложение получает NUL. Консоль и файл
+/// передаются как обычно: они никого не держат. Поэтому подмена — только
+/// по явной просьбе (`--detach-stdio`, его передаёт окно), а не при любом
+/// `--no-wait`: иначе вывод в конвейер пропадал бы молча.
+fn std_handle(which: STD_HANDLE, detach: bool, nul: &mut Option<Handle>) -> HANDLE {
+    let own = unsafe { GetStdHandle(which) };
+    if !detach || own.is_null() || own == INVALID_HANDLE_VALUE || unsafe { GetFileType(own) } != FILE_TYPE_PIPE {
+        return own;
     }
-    let name = format!("{INIT_EXPORT}\0");
-    let export = unsafe { GetProcAddress(module, name.as_ptr()) }
-        .ok_or_else(|| format!("в DLL нет экспорта {INIT_EXPORT}"))?;
-    Ok(export as usize - module as usize)
+    // Наследуются все наследуемые хэндлы, а не только указанные в
+    // STARTUPINFO, — поэтому сам канал надо сделать ненаследуемым.
+    unsafe { SetHandleInformation(own, HANDLE_FLAG_INHERIT, 0) };
+    if nul.is_none() {
+        *nul = Some(Handle(open_nul()));
+    }
+    nul.as_ref().map_or(std::ptr::null_mut(), |h| h.0)
+}
+
+/// Наследуемый хэндл NUL; при неудаче — пустой: приложение останется без
+/// этого потока, что для GUI-приложения то же самое.
+fn open_nul() -> HANDLE {
+    let attrs = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: std::ptr::null_mut(),
+        bInheritHandle: 1,
+    };
+    let handle = unsafe {
+        CreateFileW(
+            wide("NUL".as_ref()).as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            &attrs,
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        std::ptr::null_mut()
+    } else {
+        handle
+    }
 }
 
 #[cfg(test)]

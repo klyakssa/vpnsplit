@@ -1,13 +1,14 @@
 //! Лончер: запускает приложение так, чтобы его трафик шёл через туннель.
 //!
 //!   vpnsplit-launch --list
-//!   vpnsplit-launch [--adapter ТЕКСТ] [--no-wait] -- программа [аргументы...]
+//!   vpnsplit-launch [--adapter ТЕКСТ] [--no-wait] [--detach-stdio] -- программа [аргументы...]
 
 mod inject;
 
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use vpnsplit_core::hook::{DLL_NAME, IFINDEX_ENV, LOG_ENV};
+use vpnsplit_core::hook::{DLL_NAME, DNS_ENV, IFINDEX_ENV, LOG_ENV};
 use vpnsplit_core::{Request, Response, TunnelInfo, TunnelState};
 use vpnsplit_net::iface;
 
@@ -25,6 +26,7 @@ fn main() -> ExitCode {
 fn run(args: &[String]) -> Result<u32, String> {
     let mut adapter_filter: Option<String> = None;
     let mut wait = true;
+    let mut detach_stdio = false;
     let mut rest: &[String] = &[];
 
     let mut i = 0;
@@ -40,6 +42,7 @@ fn run(args: &[String]) -> Result<u32, String> {
                 adapter_filter = Some(args.get(i).ok_or("после --adapter нужно имя")?.clone());
             }
             "--no-wait" => wait = false,
+            "--detach-stdio" => detach_stdio = true,
             "--log" => {
                 i += 1;
                 let path = args.get(i).ok_or("после --log нужен путь к файлу")?;
@@ -69,8 +72,18 @@ fn run(args: &[String]) -> Result<u32, String> {
 
     let dll = dll_path()?;
     std::env::set_var(IFINDEX_ENV, tunnel.index.to_string());
+    // DNS подключения — hook.dll спросит его первым (через туннель). Уже
+    // заданные серверы остаются, но после него: значение могло достаться
+    // по наследству от прошлого запуска через другой VPN, и тогда каждое
+    // имя ждало бы мёртвый сервер; а без DNS VPN на VPN, режущем порт 53
+    // к чужим резолверам, имён не было бы вовсе.
+    let existing = std::env::var_os(DNS_ENV);
+    if let Some(list) = dns_list(&tunnel.dns, existing.as_deref().and_then(|raw| raw.to_str())) {
+        eprintln!("DNS для приложения: {list}");
+        std::env::set_var(DNS_ENV, list);
+    }
 
-    let launched = inject::launch(program, program_args, &dll, tunnel.index)?;
+    let launched = inject::launch(program, program_args, &dll, tunnel.index, detach_stdio)?;
     eprintln!("запущен {program}, pid {}, хуки установлены", launched.pid);
 
     if wait {
@@ -88,7 +101,11 @@ fn run(args: &[String]) -> Result<u32, String> {
 /// - службы нет — ищем сами, как раньше.
 fn choose_tunnel(filter: Option<&str>) -> Result<TunnelInfo, String> {
     if let Some(filter) = filter {
-        return iface::find_tunnel(Some(filter)).map(|a| a.to_info());
+        let mut info = iface::find_tunnel(Some(filter)).map(|a| a.to_info())?;
+        // DNS подключения знает только служба (OpenVPN на TAP его к адаптеру
+        // не применяет). Спрашиваем её, но не требуем: адаптер выбран явно.
+        info.dns = service_dns(info.index);
+        return Ok(info);
     }
     match vpnsplit_net::pipe::request(&Request::GetStatus) {
         Ok(Response::Status(status)) => match status.tunnel {
@@ -105,6 +122,35 @@ fn choose_tunnel(filter: Option<&str>) -> Result<TunnelInfo, String> {
             iface::find_tunnel(None).map(|a| a.to_info())
         }
     }
+}
+
+/// DNS, который служба знает для туннеля с этим индексом. Пусто — служба
+/// не ответила или туннель у неё другой.
+fn service_dns(index: u32) -> Vec<Ipv4Addr> {
+    match vpnsplit_net::pipe::request(&Request::GetStatus) {
+        Ok(Response::Status(status)) => match status.tunnel {
+            TunnelState::Up(info) if info.index == index => info.dns,
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// Значение `VPNSPLIT_DNS`: адреса через запятую, как их разбирает
+/// hook.dll, — сначала DNS подключения, затем уже заданные (`existing`),
+/// без повторов. `None` — DNS подключения нет, переменную не трогаем.
+fn dns_list(pushed: &[Ipv4Addr], existing: Option<&str>) -> Option<String> {
+    if pushed.iter().all(|a| a.is_unspecified()) {
+        return None;
+    }
+    let existing = existing.unwrap_or_default().split(',').filter_map(|part| part.trim().parse::<Ipv4Addr>().ok());
+    let mut list: Vec<Ipv4Addr> = Vec::new();
+    for address in pushed.iter().copied().chain(existing) {
+        if !address.is_unspecified() && !list.contains(&address) {
+            list.push(address);
+        }
+    }
+    Some(list.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(","))
 }
 
 fn dll_path() -> Result<PathBuf, String> {
@@ -141,5 +187,42 @@ fn print_help() {
     println!("  --list                         список адаптеров");
     println!("  [--adapter ТЕКСТ] -- прог арг  запустить через туннель");
     println!("  --no-wait                      не ждать завершения программы");
+    println!("  --detach-stdio                 не передавать программе каналы (pipe) своих stdin,");
+    println!("                                 stdout и stderr — вместо них NUL; консоль и файл");
+    println!("                                 передаются как есть. Так запускает окно vpnsplit:");
+    println!("                                 иначе оно ждало бы закрытия программы, а не лончера");
     println!("  --log ФАЙЛ                     журнал hook.dll: какие процессы получили хуки");
+    println!();
+    println!("  Имена приложение спрашивает через туннель: сначала DNS, который назначил VPN,");
+    println!("  потом DNS адаптера туннеля, потом 1.1.1.1 и 8.8.8.8. Свои серверы можно задать");
+    println!("  переменной VPNSPLIT_DNS (адреса через запятую) — они спрашиваются сразу после DNS");
+    println!("  VPN. Назначенный VPN DNS знает только служба: если она не отвечает, его не будет.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dns_goes_to_the_hook_as_a_comma_list() {
+        assert_eq!(dns_list(&[], None), None);
+        assert_eq!(dns_list(&[Ipv4Addr::UNSPECIFIED], None), None);
+        let pushed = [Ipv4Addr::new(10, 8, 0, 1), Ipv4Addr::UNSPECIFIED, Ipv4Addr::new(10, 8, 0, 2)];
+        assert_eq!(dns_list(&pushed, None).as_deref(), Some("10.8.0.1,10.8.0.2"));
+        // Без DNS подключения заданное пользователем не переписываем.
+        assert_eq!(dns_list(&[], Some("9.9.9.9")), None);
+    }
+
+    #[test]
+    fn vpn_dns_goes_before_what_was_already_set() {
+        let pushed = [Ipv4Addr::new(10, 8, 0, 1)];
+        // Свой сервер пользователя остаётся, но после DNS VPN.
+        assert_eq!(dns_list(&pushed, Some("9.9.9.9")).as_deref(), Some("10.8.0.1,9.9.9.9"));
+        // Унаследованное от прошлого запуска — без повторов, мусор
+        // отбрасывается.
+        assert_eq!(
+            dns_list(&pushed, Some(" 10.8.0.1 , мусор,10.9.0.1,,")).as_deref(),
+            Some("10.8.0.1,10.9.0.1")
+        );
+    }
 }
