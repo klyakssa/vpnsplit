@@ -79,6 +79,22 @@ const PROVIDER: GUID = GUID {
 /// FWP_E_ALREADY_EXISTS — поставщик уже заведён прошлым запуском.
 const ALREADY_EXISTS: u32 = 0x8032_0009;
 
+/// FWP_E_FILTER_NOT_FOUND — фильтра уже нет: снимать нечего, и это не сбой.
+const FILTER_NOT_FOUND: u32 = 0x8032_0003;
+
+/// Снимает фильтры по номерам. Возвращает те, что снять не удалось: их
+/// нельзя забывать — иначе запрет остался бы стоять до закрытия сеанса, а
+/// повторить снятие было бы уже не по чему.
+fn delete_filters(engine: HANDLE, ids: &[u64]) -> Vec<u64> {
+    ids.iter()
+        .copied()
+        .filter(|id| {
+            let code = unsafe { FwpmFilterDeleteById0(engine, *id) };
+            code != 0 && code != FILTER_NOT_FOUND
+        })
+        .collect()
+}
+
 /// Сколько постоянных фильтров приходится на одно приложение: запрет и по
 /// разрешению на каждую локальную сеть. Неполный набор считается
 /// испорченным и ставится заново.
@@ -114,6 +130,27 @@ fn short_name(exe: &Path) -> String {
         .unwrap_or_else(|| exe.to_string_lossy().into_owned())
 }
 
+/// Проверка настоящего файла приложения: написанный путь, путь, куда он
+/// ведёт на самом деле. `Err` — фильтр на него не ставится.
+pub type Vet = fn(&Path, &Path) -> Result<(), String>;
+
+static VET: std::sync::OnceLock<Vet> = std::sync::OnceLock::new();
+
+/// Задаёт проверку, через которую проходит каждое приложение, прежде чем
+/// получить фильтр (запрет kill-switch, разрешение или постоянный запрет).
+///
+/// Зачем она здесь, а не у того, кто зовёт. Windows ставит фильтр не на
+/// строку, а на файл, который нашла по ней, и идёт при этом по ссылкам:
+/// правило на `C:\Users\я\j\svchost.exe`, где `j` стала точкой соединения
+/// на `System32` уже после того, как правило приняли, закрыло бы сеть
+/// настоящему `svchost.exe`. Проверить путь заранее мало: ссылку можно
+/// подменить между проверкой и постановкой. Здесь же проверяется ровно
+/// тот путь, который Windows вписала в знак приложения, — другого фильтр
+/// не увидит. Задаётся один раз; повторный вызов ничего не меняет.
+pub fn vet_apps(vet: Vet) {
+    let _ = VET.set(vet);
+}
+
 /// Опознавательный знак приложения в WFP. Освобождается сам.
 struct AppId(*mut FWP_BYTE_BLOB);
 
@@ -127,7 +164,29 @@ impl AppId {
         if code != 0 || blob.is_null() {
             return Err(format!("не удалось опознать {}: {}", exe.display(), describe(code)));
         }
-        Ok(AppId(blob))
+        let app = AppId(blob);
+        if let Some(vet) = VET.get() {
+            // Путь без буквы диска (сетевой, том без буквы) в каталог
+            // Windows не ведёт: тот всегда на томе с буквой.
+            if let Some(real) = app.kernel_path().and_then(|path| crate::devpath::to_dos(&path)) {
+                vet(exe, &real)?;
+            }
+        }
+        Ok(app)
+    }
+
+    /// Путь ядра из знака (`\device\harddiskvolume3\…`): знак — это он и
+    /// есть, строкой UTF-16 с нулём на конце.
+    fn kernel_path(&self) -> Option<String> {
+        let blob = unsafe { &*self.0 };
+        if blob.data.is_null() || blob.size < 2 {
+            return None;
+        }
+        let bytes = unsafe { std::slice::from_raw_parts(blob.data, blob.size as usize) };
+        let units: Vec<u16> =
+            (0..bytes.len() / 2).map(|at| u16::from_le_bytes([bytes[2 * at], bytes[2 * at + 1]])).collect();
+        let end = units.iter().position(|&unit| unit == 0).unwrap_or(units.len());
+        String::from_utf16(&units[..end]).ok()
     }
 
     fn condition(&self) -> FWPM_FILTER_CONDITION0 {
@@ -224,6 +283,11 @@ unsafe fn add_filter(
 
 /// Запрет приложению и разрешения на локальную сеть поверх него.
 ///
+/// Всё или ничего: если какой-то фильтр набора не встал, уже добавленные
+/// снимаются тут же. Иначе их номера пропали бы вместе с ошибкой, и запрет
+/// без своих разрешений жил бы до закрытия сеанса — то есть до перезапуска
+/// службы, — хотя kill-switch для всех уже выключен.
+///
 /// # Safety
 /// `engine` — открытый хэндл движка.
 unsafe fn add_block_set(
@@ -233,8 +297,35 @@ unsafe fn add_block_set(
     local: (u8, &str),
     life: Life,
 ) -> Result<Vec<u64>, String> {
+    let mut added = Vec::with_capacity(FILTERS_PER_APP);
+    match add_block_set_into(engine, app, block, local, life, &mut added) {
+        Ok(()) => Ok(added),
+        Err(e) => {
+            let stuck = delete_filters(engine, &added);
+            if stuck.is_empty() {
+                Err(e)
+            } else {
+                Err(format!("{e}; уже добавленные фильтры {stuck:?} снять не удалось"))
+            }
+        }
+    }
+}
+
+/// Сами шаги `add_block_set`: номер каждого добавленного фильтра сразу
+/// записывается в `added`, чтобы при сбое было что снимать.
+///
+/// # Safety
+/// `engine` — открытый хэндл движка.
+unsafe fn add_block_set_into(
+    engine: HANDLE,
+    app: &AppId,
+    block: (u8, &str),
+    local: (u8, &str),
+    life: Life,
+    added: &mut Vec<u64>,
+) -> Result<(), String> {
     let by_app = app.condition();
-    let mut added = vec![add_filter(engine, &[by_app], FWP_ACTION_BLOCK, block.0, block.1, life)?];
+    added.push(add_filter(engine, &[by_app], FWP_ACTION_BLOCK, block.0, block.1, life)?);
     let mut masks = local_masks();
     for mask in masks.iter_mut() {
         let by_address = FWPM_FILTER_CONDITION0 {
@@ -254,7 +345,7 @@ unsafe fn add_block_set(
             life,
         )?);
     }
-    Ok(added)
+    Ok(())
 }
 
 fn open_engine(dynamic: bool) -> Result<HANDLE, String> {
@@ -276,8 +367,15 @@ fn open_engine(dynamic: bool) -> Result<HANDLE, String> {
 /// службы: запреты kill-switch и разрешения «служба жива».
 pub struct Guard {
     engine: HANDLE,
-    /// Запреты kill-switch и их разрешения на локальную сеть.
-    filters: Vec<u64>,
+    /// Запреты kill-switch и их разрешения на локальную сеть: приложение →
+    /// номера его фильтров. По приложениям — чтобы набор запретов можно
+    /// было приводить к нужному разностью, не снимая стоящих.
+    filters: Vec<(String, Vec<u64>)>,
+    /// Фильтры kill-switch, которые снять не удалось. Забыть их нельзя:
+    /// запрет стоял бы до перезапуска службы, а снять его было бы уже не по
+    /// чему. Каждый `clear` и `unblock_except` пробует снова. Отдельно от
+    /// `filters`, чтобы остаток набора не сошёл там за целый запрет.
+    stuck: Vec<u64>,
     /// Разрешения «служба жива»: приложение → номер фильтра.
     alive: Vec<(String, u64)>,
 }
@@ -289,37 +387,91 @@ impl Guard {
     /// Требует прав администратора. Служба работает под SYSTEM, а вот
     /// консольный режим движок не откроет — и это не повод падать.
     pub fn open() -> Result<Guard, String> {
-        Ok(Guard { engine: open_engine(true)?, filters: Vec::new(), alive: Vec::new() })
+        Ok(Guard {
+            engine: open_engine(true)?,
+            filters: Vec::new(),
+            stuck: Vec::new(),
+            alive: Vec::new(),
+        })
     }
 
+    /// Скольким приложениям сейчас закрыта сеть.
     pub fn blocked(&self) -> usize {
         self.filters.len()
     }
 
-    /// Запрещает приложению сеть, кроме локальной.
+    /// Запрещает приложению сеть, кроме локальной. Уже стоящий запрет не
+    /// трогается и не ставится второй раз.
     pub fn block(&mut self, exe: &Path) -> Result<(), String> {
+        let key = app_key(exe);
+        if self.filters.iter().any(|(known, _)| *known == key) {
+            return Ok(());
+        }
         let app = AppId::of(exe)?;
         let name = short_name(exe);
-        let added = unsafe {
-            add_block_set(
+        // Набор ставится по шагам, без транзакции: при сбое посреди него уже
+        // добавленное снимается тут же, а не снявшееся запоминается.
+        let mut added = Vec::with_capacity(FILTERS_PER_APP);
+        let outcome = unsafe {
+            add_block_set_into(
                 self.engine,
                 &app,
                 (WEIGHT_BLOCK, &format!("vpnsplit: {name} без туннеля")),
                 (WEIGHT_PERMIT, &format!("vpnsplit: {name} в локальную сеть")),
                 Life::Dynamic,
-            )?
+                &mut added,
+            )
         };
-        self.filters.extend(added);
-        Ok(())
+        match outcome {
+            Ok(()) => {
+                self.filters.push((key, added));
+                Ok(())
+            }
+            Err(e) => {
+                let stuck = delete_filters(self.engine, &added);
+                self.stuck.extend(stuck);
+                Err(e)
+            }
+        }
+    }
+
+    /// Ещё раз снимает фильтры, которые не снялись прежде.
+    fn retry_stuck(&mut self) {
+        if !self.stuck.is_empty() {
+            self.stuck = delete_filters(self.engine, &self.stuck);
+        }
     }
 
     /// Снимает запреты kill-switch. Чужие фильтры не трогает: удаляем
     /// только то, что сами добавили, по сохранённым номерам. Разрешения
     /// «служба жива» остаются — они не про туннель.
+    ///
+    /// Номера, которые снять не удалось, остаются записанными (`stuck`):
+    /// следующий вызов попробует снова.
     pub fn clear(&mut self) {
-        for id in self.filters.drain(..) {
-            unsafe { FwpmFilterDeleteById0(self.engine, id) };
+        self.retry_stuck();
+        for (_, ids) in std::mem::take(&mut self.filters) {
+            let stuck = delete_filters(self.engine, &ids);
+            self.stuck.extend(stuck);
         }
+    }
+
+    /// Снимает запреты kill-switch со всех, кого нет в `keep`. Остальные
+    /// стоят как стояли: снять и поставить заново значило бы оставить
+    /// приложение на это время без запрета. Возвращает, со скольких снято.
+    pub fn unblock_except(&mut self, keep: &[PathBuf]) -> usize {
+        let keep: Vec<String> = keep.iter().map(|exe| app_key(exe)).collect();
+        self.retry_stuck();
+        let before = self.filters.len();
+        let (stay, gone): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.filters).into_iter().partition(|(key, _)| keep.contains(key));
+        self.filters = stay;
+        // Не снявшиеся номера запоминаются, как и в `clear`.
+        for (_, ids) in gone {
+            let stuck = delete_filters(self.engine, &ids);
+            self.stuck.extend(stuck);
+        }
+        before - self.filters.len()
     }
 
     /// Разрешение «служба жива»: перевешивает постоянный запрет, пока этот
@@ -649,6 +801,24 @@ fn describe(code: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_app_id_names_the_real_file() {
+        // Знак приложения строится без движка фильтрации и без прав; путь в
+        // нём — тот самый файл, на который встанет фильтр.
+        let me = std::env::current_exe().unwrap();
+        let app = AppId::of(&me).unwrap();
+        let kernel = app.kernel_path().unwrap();
+        assert!(kernel.starts_with(r"\device\"), "{kernel}");
+        match crate::devpath::to_dos(&kernel) {
+            Some(real) => assert_eq!(
+                real.to_string_lossy().to_lowercase(),
+                me.to_string_lossy().to_lowercase()
+            ),
+            // Диск подставной (subst) или сетевой: буквы у тома нет.
+            None => println!("ПРОВЕРКИ НЕ БЫЛО: у тома {kernel} нет буквы"),
+        }
+    }
 
     #[test]
     fn masks_cover_exactly_the_local_networks() {

@@ -34,8 +34,10 @@
 use std::ffi::c_void;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
+use std::sync::OnceLock;
+use windows_sys::Win32::Foundation::{
+    CloseHandle, FreeLibrary, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
 /// Слои WinDivert. На NETWORK ходят сами пакеты, на FLOW и SOCKET — только
@@ -86,12 +88,21 @@ type CompileFn = unsafe extern "system" fn(
     *mut u32,
 ) -> i32;
 
-static OPEN: AtomicUsize = AtomicUsize::new(0);
-static RECV: AtomicUsize = AtomicUsize::new(0);
-static SEND: AtomicUsize = AtomicUsize::new(0);
-static SHUTDOWN: AtomicUsize = AtomicUsize::new(0);
-static CHECKSUM: AtomicUsize = AtomicUsize::new(0);
-static COMPILE: AtomicUsize = AtomicUsize::new(0);
+/// Функции библиотеки — все разом. Публикуется только целиком, когда
+/// нашлась каждая: раньше признаком «загружено» был один `WinDivertOpen`,
+/// записанный первым, и соседний поток (или повторная попытка после
+/// неполной загрузки) мог вызвать ещё не найденную функцию по нулевому
+/// адресу.
+struct Api {
+    open: OpenFn,
+    recv: RecvFn,
+    send: SendFn,
+    shutdown: ShutdownFn,
+    checksum: ChecksumFn,
+    compile: CompileFn,
+}
+
+static API: OnceLock<Api> = OnceLock::new();
 
 /// `WINDIVERT_ADDRESS`. Первые два поля — время и упакованные биты, дальше
 /// объединение на 64 байта: какой его вариант осмыслен, говорит `layer`.
@@ -116,10 +127,10 @@ union Payload {
 
 /// `WINDIVERT_DATA_SOCKET` и `WINDIVERT_DATA_FLOW` — одна и та же форма.
 ///
-/// Адреса драйвер кладёт в сетевом порядке байт, а **порты — в порядке
-/// узла**. Это легко перепутать: порядок разный внутри одной структуры.
-/// Проверено наблюдением: обращение к веб-серверу приходит как 80, к
-/// службе имён — как 53, без всякой перестановки байт.
+/// Порты драйвер кладёт **в порядке узла**, и адреса тоже: каждое слово
+/// адреса — число, а слова идут от младшего к старшему (см.
+/// `words_to_address`). Проверено наблюдением: обращение к веб-серверу
+/// приходит как 80, к службе имён — как 53, без всякой перестановки байт.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SocketData {
@@ -177,7 +188,7 @@ impl Address {
 
     /// Интерфейс — только для слоя пакетов.
     pub fn interface(&self) -> Option<NetworkData> {
-        (self.layer() == LAYER_NETWORK).then(|| unsafe { self.payload.network })
+        (self.layer() == LAYER_NETWORK).then_some(unsafe { self.payload.network })
     }
 
     /// Куда отправить пакет обратно. Для входящего пакета это существенно:
@@ -198,7 +209,7 @@ impl Address {
     }
 
     /// Удалённый адрес соединения. Для IPv4 драйвер кладёт его в первое
-    /// слово четвёрки, в сетевом порядке байт.
+    /// слово четвёрки — числом, см. `words_to_address`.
     pub fn remote(&self) -> IpAddr {
         let Some(socket) = self.socket() else {
             return IpAddr::V4(Ipv4Addr::UNSPECIFIED);
@@ -215,10 +226,16 @@ impl Address {
     }
 }
 
+/// Адрес из четырёх слов `WINDIVERT_DATA_SOCKET`/`FLOW`.
+///
+/// Драйвер хранит адрес в порядке узла целиком: каждое слово — число, а
+/// сами слова идут от младшего к старшему. IPv4 лежит как IPv4 в IPv6:
+/// `[v4, 0x0000FFFF, 0, 0]` — потому он и оказывается в первом слове. Для
+/// IPv6 слова надо брать с конца: `[3]` — старшее, первые октеты адреса.
 fn words_to_address(words: &[u32; 4], ipv6: bool) -> IpAddr {
     if ipv6 {
         let mut octets = [0u8; 16];
-        for (i, word) in words.iter().enumerate() {
+        for (i, word) in words.iter().rev().enumerate() {
             octets[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
         }
         IpAddr::V6(Ipv6Addr::from(octets))
@@ -263,11 +280,45 @@ pub fn describe_protocol(protocol: u8) -> &'static str {
     }
 }
 
-/// Загружает `WinDivert.dll` рядом с собой. Повторный вызов ничего не делает.
-fn load() -> Result<(), String> {
-    if OPEN.load(Ordering::Acquire) != 0 {
-        return Ok(());
+/// Функции `WinDivert.dll`, загруженной рядом с собой. Повторный вызов
+/// ничего не грузит.
+///
+/// Неудача не запоминается: библиотеку могут положить рядом позже (её
+/// возвращает антивирус, её ставит обновление), и следующая попытка должна
+/// её найти.
+fn api() -> Result<&'static Api, String> {
+    if let Some(api) = API.get() {
+        return Ok(api);
     }
+    let api = load()?;
+    // Два потока могли загрузить одновременно: остаётся тот, кто успел
+    // первым, второй набор — те же адреса той же библиотеки.
+    let _ = API.set(api);
+    API.get().ok_or_else(|| "WinDivert.dll: функции не сохранились".to_owned())
+}
+
+/// Адрес одной функции библиотеки в виде нужного указателя.
+///
+/// # Safety
+/// `F` — указатель на функцию с той подписью, которую библиотека
+/// действительно экспортирует под этим именем.
+unsafe fn symbol<F: Copy>(
+    module: windows_sys::Win32::Foundation::HMODULE,
+    name: &std::ffi::CStr,
+) -> Result<F, String> {
+    let Some(address) = GetProcAddress(module, name.as_ptr() as *const u8) else {
+        return Err(format!("в WinDivert.dll нет {name:?}"));
+    };
+    // Указатель на функцию в указатель на функцию: размер один, и нуля
+    // здесь быть не может — его отсеял `Option` выше.
+    if std::mem::size_of::<F>() != std::mem::size_of_val(&address) {
+        return Err(format!("{name:?}: размер указателя не совпал"));
+    }
+    Ok(std::mem::transmute_copy(&address))
+}
+
+/// Загружает `WinDivert.dll` рядом с собой и находит все нужные функции.
+fn load() -> Result<Api, String> {
     let exe = std::env::current_exe().map_err(|e| format!("не найден свой путь: {e}"))?;
     let dll = exe.with_file_name("WinDivert.dll");
     if !dll.exists() {
@@ -280,20 +331,26 @@ fn load() -> Result<(), String> {
             GetLastError()
         }));
     }
-    for (name, slot) in [
-        (c"WinDivertOpen", &OPEN),
-        (c"WinDivertRecv", &RECV),
-        (c"WinDivertSend", &SEND),
-        (c"WinDivertShutdown", &SHUTDOWN),
-        (c"WinDivertHelperCalcChecksums", &CHECKSUM),
-        (c"WinDivertHelperCompileFilter", &COMPILE),
-    ] {
-        let Some(address) = (unsafe { GetProcAddress(module, name.as_ptr() as *const u8) }) else {
-            return Err(format!("в WinDivert.dll нет {name:?}"));
-        };
-        slot.store(address as usize, Ordering::Release);
+    let api = unsafe {
+        (|| {
+            Ok(Api {
+                open: symbol(module, c"WinDivertOpen")?,
+                recv: symbol(module, c"WinDivertRecv")?,
+                send: symbol(module, c"WinDivertSend")?,
+                shutdown: symbol(module, c"WinDivertShutdown")?,
+                checksum: symbol(module, c"WinDivertHelperCalcChecksums")?,
+                compile: symbol(module, c"WinDivertHelperCompileFilter")?,
+            })
+        })()
+    };
+    if api.is_err() {
+        // Чужая версия без нужной функции: выгружаем, иначе образ останется
+        // в памяти и следующий LoadLibraryW по тому же пути вернёт его же,
+        // даже когда на диск уже положили правильную библиотеку. Ни один
+        // адрес из неё никуда не ушёл, так что выгружать безопасно.
+        unsafe { FreeLibrary(module) };
     }
-    Ok(())
+    api
 }
 
 fn wide(path: &Path) -> Vec<u16> {
@@ -304,6 +361,9 @@ fn wide(path: &Path) -> Vec<u16> {
 /// Открытая ручка WinDivert.
 pub struct Handle {
     handle: HANDLE,
+    /// Функции библиотеки. Ручка без них не открывается, поэтому дальше
+    /// они есть всегда.
+    api: &'static Api,
     /// Рабочий режим: пакет, который не отправить обратно, пропадёт.
     intercepting: bool,
 }
@@ -341,16 +401,16 @@ impl Handle {
     }
 
     fn open(filter: &str, layer: u8, flags: u64) -> Result<Handle, String> {
-        load()?;
-        let open: OpenFn = unsafe { std::mem::transmute(OPEN.load(Ordering::Acquire)) };
+        let api = api()?;
         let filter = std::ffi::CString::new(filter).map_err(|_| "фильтр с нулём внутри")?;
-        let handle = unsafe { open(filter.as_ptr() as *const u8, layer as u32, 0, flags) };
+        let handle = unsafe { (api.open)(filter.as_ptr() as *const u8, layer as u32, 0, flags) };
         if handle == INVALID_HANDLE_VALUE {
             let code = unsafe { GetLastError() };
             return Err(describe_open(code));
         }
         Ok(Handle {
             handle,
+            api,
             intercepting: flags & FLAG_SNIFF == 0,
         })
     }
@@ -360,11 +420,10 @@ impl Handle {
     /// `Err` несёт код ошибки: 232 (`ERROR_NO_DATA`) — это нормальный
     /// конец, ручку закрыли.
     pub fn next(&self) -> Result<Address, u32> {
-        let recv: RecvFn = unsafe { std::mem::transmute(RECV.load(Ordering::Acquire)) };
         let mut address: Address = unsafe { std::mem::zeroed() };
         let mut length = 0u32;
         let ok = unsafe {
-            recv(
+            (self.api.recv)(
                 self.handle,
                 std::ptr::null_mut(),
                 0,
@@ -380,11 +439,10 @@ impl Handle {
 
     /// Следующий пакет. Возвращает его длину в переданном буфере.
     pub fn next_packet(&self, buffer: &mut [u8]) -> Result<(usize, Address), u32> {
-        let recv: RecvFn = unsafe { std::mem::transmute(RECV.load(Ordering::Acquire)) };
         let mut address: Address = unsafe { std::mem::zeroed() };
         let mut length = 0u32;
         let ok = unsafe {
-            recv(
+            (self.api.recv)(
                 self.handle,
                 buffer.as_mut_ptr() as *mut c_void,
                 buffer.len() as u32,
@@ -401,10 +459,9 @@ impl Handle {
     /// Отправляет пакет обратно в сеть. Для перехваченного пакета это
     /// обязательно: иначе он просто не дойдёт.
     pub fn send(&self, packet: &[u8], address: &Address) -> Result<(), u32> {
-        let send: SendFn = unsafe { std::mem::transmute(SEND.load(Ordering::Acquire)) };
         let mut sent = 0u32;
         let ok = unsafe {
-            send(
+            (self.api.send)(
                 self.handle,
                 packet.as_ptr() as *const c_void,
                 packet.len() as u32,
@@ -432,8 +489,7 @@ impl Handle {
     }
 
     fn shutdown(&self, how: u32) {
-        let shutdown: ShutdownFn = unsafe { std::mem::transmute(SHUTDOWN.load(Ordering::Acquire)) };
-        unsafe { shutdown(self.handle, how) };
+        unsafe { (self.api.shutdown)(self.handle, how) };
     }
 
     /// Рабочая ли это ручка. Нужно одному: не дать перехватывающей ручке
@@ -451,13 +507,12 @@ impl Handle {
 /// знать, сколько их влезет, надо до того, как от этого числа начнёт
 /// зависеть работа.
 pub fn check_filter(filter: &str, layer: u8) -> Result<(), String> {
-    load()?;
-    let compile: CompileFn = unsafe { std::mem::transmute(COMPILE.load(Ordering::Acquire)) };
+    let api = api()?;
     let text = std::ffi::CString::new(filter).map_err(|_| "фильтр с нулём внутри")?;
     let mut message: *const u8 = std::ptr::null();
     let mut position = 0u32;
     let ok = unsafe {
-        compile(
+        (api.compile)(
             text.as_ptr() as *const u8,
             layer as u32,
             std::ptr::null_mut(),
@@ -481,12 +536,14 @@ pub fn check_filter(filter: &str, layer: u8) -> Result<(), String> {
 /// Пересчитывает контрольные суммы после правки заголовков. Своей
 /// арифметики тут нет намеренно: в библиотеке она уже есть и проверена.
 pub fn fix_checksums(packet: &mut [u8], address: &Address) -> bool {
-    let calc: ChecksumFn = unsafe { std::mem::transmute(CHECKSUM.load(Ordering::Acquire)) };
-    if calc as usize == 0 {
+    // Библиотека не загружена — пересчитать нечем. Раньше здесь нулевой
+    // адрес превращался в указатель на функцию и только потом сравнивался
+    // с нулём: такое сравнение компилятор вправе выбросить.
+    let Some(api) = API.get() else {
         return false;
-    }
+    };
     let ok = unsafe {
-        calc(
+        (api.checksum)(
             packet.as_mut_ptr() as *mut c_void,
             packet.len() as u32,
             address,
@@ -596,12 +653,22 @@ mod tests {
     fn ipv6_is_collected_from_four_words() {
         let mut address: Address = unsafe { std::mem::zeroed() };
         address.bits = LAYER_SOCKET as u32 | (1 << 20); // ipv6
+        // Так кладёт драйвер: слово [3] — старшее, с первыми октетами.
+        address.socket_mut().remote_addr = [0x0000_0001, 0, 0, 0x2001_0db8];
         let expected: Ipv6Addr = "2001:db8::1".parse().unwrap();
-        for (i, chunk) in expected.octets().chunks(4).enumerate() {
-            address.socket_mut().remote_addr[i] =
-                u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-        }
         assert_eq!(address.remote(), IpAddr::V6(expected));
+    }
+
+    #[test]
+    fn a_dual_stack_ipv4_comes_out_as_mapped_ipv4() {
+        // Сокет двойного режима соединяется с 8.8.8.8: событие с битом IPv6,
+        // а слова — как у IPv4 в IPv6. Перевёрнутый порядок дал бы
+        // 808:808:0:ffff:: — и соединение сочлось бы за IPv6.
+        let mut address: Address = unsafe { std::mem::zeroed() };
+        address.bits = LAYER_SOCKET as u32 | (1 << 20);
+        address.socket_mut().remote_addr = [u32::from_be_bytes([8, 8, 8, 8]), 0x0000_FFFF, 0, 0];
+        let IpAddr::V6(remote) = address.remote() else { panic!("ждали IPv6") };
+        assert_eq!(remote.to_ipv4_mapped(), Some(Ipv4Addr::new(8, 8, 8, 8)));
     }
 
     #[test]

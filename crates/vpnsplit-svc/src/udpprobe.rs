@@ -184,7 +184,15 @@ fn report(store: &Store, seen: &Seen, seconds: u32, ticks: i64) {
     // и спросить можно только у таблицы ядра — если он ещё жив. Без этого
     // первый же замер под нагрузкой назвал 2813 пакетов из 2818 «хозяин
     // неизвестен», то есть не ответил на вопрос, ради которого делался.
-    let table = vpnsplit_net::udptable::sockets();
+    let table = match vpnsplit_net::udptable::sockets() {
+        Ok(table) => table,
+        Err(e) => {
+            // Это замер: без таблицы хозяева старых сокетов останутся
+            // неизвестными, и это надо видеть, а не принимать за «ничьи».
+            store.log(&format!("UDP: таблица сокетов ядра не прочиталась ({e})"));
+            Vec::new()
+        }
+    };
     let owner = |port: u16| -> Option<u32> {
         seen.binds
             .get(&port)

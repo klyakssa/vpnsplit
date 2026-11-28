@@ -49,6 +49,7 @@ impl Adapter {
             name: self.name.clone(),
             ipv4: self.ipv4,
             captures_all: crate::routes::captures_all_traffic(self.index.get()),
+            dns: Vec::new(),
         }
     }
 }

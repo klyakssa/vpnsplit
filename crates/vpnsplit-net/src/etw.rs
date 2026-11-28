@@ -289,6 +289,11 @@ impl Trace {
             return Err(format!("OpenTraceW не удался (код {code})"));
         }
 
+        // Объект собирается до запуска потока: если поток не заведётся, его
+        // Drop остановит сеанс, закроет трассу и освободит обработчик. Иначе
+        // сеанс — объект ядра — пережил бы и службу, заняв один из 64 слотов.
+        let mut started = Trace { session, trace, worker: None, sink, name };
+
         // ProcessTrace блокируется до закрытия трассы — ему нужен свой поток.
         let worker = std::thread::Builder::new()
             .name("etw".into())
@@ -297,8 +302,9 @@ impl Trace {
                 unsafe { ProcessTrace(handles.as_ptr(), 1, std::ptr::null(), std::ptr::null()) };
             })
             .map_err(|e| format!("не удалось запустить поток ETW: {e}"))?;
+        started.worker = Some(worker);
 
-        Ok(Trace { session, trace, worker: Some(worker), sink, name })
+        Ok(started)
     }
 
     /// Просит отдать накопленные события сейчас — по хэндлу сеанса.
@@ -503,7 +509,7 @@ pub fn flush_by_name(session_name: &str) -> Result<(), u32> {
 /// дорого: это загрузка схемы провайдера на каждое событие.
 pub fn leading_string(payload: &[u8]) -> Option<String> {
     let words: Vec<u16> = payload
-        .chunks_exact(2)
+        .as_chunks::<2>().0.iter()
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .take_while(|word| *word != 0)
         .collect();

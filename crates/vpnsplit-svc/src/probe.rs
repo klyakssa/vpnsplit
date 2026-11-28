@@ -55,15 +55,18 @@ pub fn run_flows(store: &Store, seconds: u32) -> Result<(), String> {
             let Some(socket) = address.socket().copied() else {
                 continue;
             };
-            let key = match address.remote() {
-                std::net::IpAddr::V4(remote) => Some(crate::flows::Key {
-                    protocol: socket.protocol,
-                    local_port: socket.local_port,
-                    remote,
-                    remote_port: socket.remote_port,
-                }),
-                std::net::IpAddr::V6(_) => None,
+            // Сокет двойного режима сообщает адрес IPv4 как `::ffff:a.b.c.d`;
+            // на проводе это IPv4, и считаем его так же.
+            let remote = match address.remote() {
+                std::net::IpAddr::V4(remote) => Some(remote),
+                std::net::IpAddr::V6(remote) => remote.to_ipv4_mapped(),
             };
+            let key = remote.map(|remote| crate::flows::Key {
+                protocol: socket.protocol,
+                local_port: socket.local_port,
+                remote,
+                remote_port: socket.remote_port,
+            });
             match divert::describe_event(address.event()) {
                 "поток открыт" => {
                     opened += 1;

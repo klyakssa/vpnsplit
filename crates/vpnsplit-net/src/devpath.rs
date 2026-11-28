@@ -20,22 +20,42 @@ type Volumes = Vec<(String, String)>;
 struct Cache {
     volumes: Volumes,
     loaded: Option<Instant>,
+    /// Маска букв (`GetLogicalDrives`) на момент чтения томов.
+    mask: u32,
 }
 
-static CACHE: Mutex<Cache> = Mutex::new(Cache { volumes: Vec::new(), loaded: None });
+static CACHE: Mutex<Cache> = Mutex::new(Cache { volumes: Vec::new(), loaded: None, mask: 0 });
 
 /// Как часто можно переспрашивать систему, если путь не узнан. Том могли
 /// подключить после нас — тогда переспросить надо; но путь может быть и
 /// вовсе без буквы (сетевой), и опрашивать диски на каждый такой незачем.
 const RELOAD_EVERY: Duration = Duration::from_secs(5);
 
+/// Сколько верить кешу, даже когда перевод удаётся. Букву тому могут
+/// сменить («Управление дисками»), а старая пара «том — буква» продолжала
+/// бы совпадать, и путь уходил бы на несуществующий или чужой диск — до
+/// перезапуска службы. Смену набора букв видно по маске сразу; срок ловит
+/// перестановку, при которой набор букв остался прежним.
+const TRUST_FOR: Duration = Duration::from_secs(60);
+
+/// Устарел ли кеш, прочитанный тогда-то при такой-то маске букв. Отдельно
+/// от системы — чтобы проверять без неё.
+fn stale(loaded: Option<Instant>, mask_then: u32, mask_now: u32, now: Instant) -> bool {
+    match loaded {
+        None => true,
+        Some(at) => mask_then != mask_now || now.saturating_duration_since(at) >= TRUST_FOR,
+    }
+}
+
 /// Привычный путь по пути ядра. `None` — буквы у этого тома нет или путь
 /// не похож на путь ядра; придумывать ответ в обоих случаях нельзя.
 pub fn to_dos(kernel_path: &str) -> Option<PathBuf> {
     let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if cache.loaded.is_none() {
-        cache.volumes = volumes();
-        cache.loaded = Some(Instant::now());
+    // Маска — одно дешёвое обращение без ввода-вывода; тома же
+    // переспрашиваются по букве, поэтому их — только когда пора.
+    let mask = unsafe { GetLogicalDrives() };
+    if stale(cache.loaded, cache.mask, mask, Instant::now()) {
+        reload(&mut cache, mask);
     }
     if let Some(found) = translate(kernel_path, &cache.volumes) {
         return Some(PathBuf::from(found));
@@ -43,9 +63,14 @@ pub fn to_dos(kernel_path: &str) -> Option<PathBuf> {
     if cache.loaded.is_some_and(|at| at.elapsed() < RELOAD_EVERY) {
         return None;
     }
-    cache.volumes = volumes();
-    cache.loaded = Some(Instant::now());
+    reload(&mut cache, mask);
     translate(kernel_path, &cache.volumes).map(PathBuf::from)
+}
+
+fn reload(cache: &mut Cache, mask: u32) {
+    cache.volumes = volumes(mask);
+    cache.mask = mask;
+    cache.loaded = Some(Instant::now());
 }
 
 /// Сама подстановка, без обращений к системе.
@@ -62,9 +87,9 @@ fn translate(kernel_path: &str, volumes: &[(String, String)]) -> Option<String> 
     })
 }
 
-/// Какие тома под какими буквами стоят сейчас.
-fn volumes() -> Volumes {
-    let mask = unsafe { GetLogicalDrives() };
+/// Какие тома под какими буквами стоят сейчас. `mask` — буквы по
+/// `GetLogicalDrives`.
+fn volumes(mask: u32) -> Volumes {
     let mut found = Vec::new();
     for index in 0..26u32 {
         if mask & (1 << index) == 0 {
@@ -136,11 +161,27 @@ mod tests {
         assert_eq!(translate("\\Device\\HarddiskVolumeé\\a.exe", &sample()), None);
     }
 
+    #[test]
+    fn the_cache_is_reread_when_letters_change_or_it_grows_old() {
+        let now = Instant::now();
+        let fresh = Some(now);
+        // Никогда не читали — читать.
+        assert!(stale(None, 0, 0b100, now));
+        // Свежий, буквы те же — верим.
+        assert!(!stale(fresh, 0b100, 0b100, now));
+        // Набор букв сменился — перечитать сразу, не дожидаясь срока.
+        assert!(stale(fresh, 0b100, 0b1100, now));
+        // Буквы те же, но срок вышел: тому могли переставить букву.
+        if let Some(old) = now.checked_sub(TRUST_FOR) {
+            assert!(stale(Some(old), 0b100, 0b100, now));
+        }
+    }
+
     /// Проверка на живой системе: системный диск обязан найтись, и путь
     /// ядра к собственному образу теста должен вернуться в привычный вид.
     #[test]
     fn the_running_system_knows_its_own_volumes() {
-        let found = volumes();
+        let found = volumes(unsafe { GetLogicalDrives() });
         println!("тома: {found:?}");
         assert!(!found.is_empty(), "ни одной буквы диска — такого не бывает");
         let me = std::env::current_exe().unwrap();

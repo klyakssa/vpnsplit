@@ -25,33 +25,16 @@ struct Row {
 }
 
 /// Все сокеты UDP над IPv4: местный порт и номер процесса.
-pub fn sockets() -> Vec<(u16, u32)> {
-    let mut size = 0u32;
-    // Первый вызов спрашивает размер: таблица меняется, запас не поможет.
-    unsafe {
-        GetExtendedUdpTable(std::ptr::null_mut(), &mut size, 0, AF_INET as u32, UDP_TABLE_OWNER_PID, 0)
-    };
-    if size == 0 {
-        return Vec::new();
-    }
-    // Между двумя вызовами таблица могла вырасти — берём с запасом, иначе
-    // второй вызов вернёт «мало места», и мы решили бы, что порт ничей.
-    size += 512;
-    let mut buffer = vec![0u8; size as usize];
-    let code = unsafe {
-        GetExtendedUdpTable(
-            buffer.as_mut_ptr() as *mut _,
-            &mut size,
-            0,
-            AF_INET as u32,
-            UDP_TABLE_OWNER_PID,
-            0,
-        )
-    };
-    if code != 0 {
-        return Vec::new();
-    }
-    parse(&buffer)
+///
+/// Между вопросом о размере и чтением таблица может вырасти; это
+/// переспрашивается с запасом (`tcptable::read_table`). `Err` — таблицу
+/// прочитать не удалось, и это не «порт ничей»: решить так значило бы
+/// выпустить своё домой.
+pub fn sockets() -> std::io::Result<Vec<(u16, u32)>> {
+    let buffer = crate::tcptable::read_table(|buffer, size| unsafe {
+        GetExtendedUdpTable(buffer, size, 0, AF_INET as u32, UDP_TABLE_OWNER_PID, 0)
+    })?;
+    Ok(parse(&buffer))
 }
 
 /// Разбор буфера: число строк, за ним сами строки.
@@ -74,12 +57,13 @@ fn parse(buffer: &[u8]) -> Vec<(u16, u32)> {
 }
 
 /// Все процессы, у которых открыт сокет UDP на этом местном порту.
-pub fn owners(local_port: u16) -> Vec<u32> {
-    sockets()
+/// `Err` — таблицу прочитать не удалось, хозяева неизвестны.
+pub fn owners(local_port: u16) -> std::io::Result<Vec<u32>> {
+    Ok(sockets()?
         .into_iter()
         .filter(|(port, _)| *port == local_port)
         .map(|(_, pid)| pid)
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -94,7 +78,7 @@ mod tests {
     fn we_find_our_own_socket_by_its_port() {
         let socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         let port = socket.local_addr().unwrap().port();
-        let found = owners(port);
+        let found = owners(port).expect("таблица UDP");
         assert!(found.contains(&std::process::id()), "порт {port}: {found:?}");
     }
 
@@ -105,7 +89,7 @@ mod tests {
             let socket = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
             socket.local_addr().unwrap().port()
         };
-        assert!(!owners(port).contains(&std::process::id()));
+        assert!(!owners(port).expect("таблица UDP").contains(&std::process::id()));
     }
 
     #[test]
@@ -128,9 +112,11 @@ mod tests {
         let started = std::time::Instant::now();
         const TIMES: u32 = 200;
         for _ in 0..TIMES {
-            assert!(!owners(port).is_empty());
+            assert!(!owners(port).expect("таблица UDP").is_empty());
         }
         let each = started.elapsed().as_micros() / TIMES as u128;
-        println!("обращение к таблице UDP: {each} мкс, сокетов в таблице {}", sockets().len());
+        println!("обращение к таблице UDP: {each} мкс, сокетов в таблице {}",
+            sockets().map_or(0, |all| all.len())
+        );
     }
 }

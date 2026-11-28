@@ -8,7 +8,8 @@
 
 use std::path::PathBuf;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_BAD_LENGTH, FILETIME, GetLastError, INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_BAD_LENGTH, FILETIME, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+    STILL_ACTIVE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, Process32FirstW, Process32NextW,
@@ -16,7 +17,8 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows_sys::Win32::Storage::Packaging::Appx::GetPackageFamilyName;
 use windows_sys::Win32::System::Threading::{
-    GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetExitCodeProcess, GetProcessTimes, OpenProcess, QueryFullProcessImageNameW,
+    WaitForSingleObject, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
 };
 
 fn from_wide(buffer: &[u16]) -> String {
@@ -58,10 +60,44 @@ pub fn created(pid: u32) -> Option<u64> {
     if process.is_null() {
         return None;
     }
+    let creation = creation_time(process);
+    unsafe { CloseHandle(process) };
+    creation
+}
+
+/// То же, что `created`, но только у процесса, который ещё работает.
+///
+/// `created` отвечает и о завершившемся процессе, если кто-то ещё держит
+/// его ручку: объект процесса живёт, пока открыт, а родитель, вызвавший
+/// `CreateProcess`, обычно держит ручку ребёнка и после его конца. Кому
+/// нужно «жив ли», а не «кто это был», нужна эта функция.
+pub fn running_since(pid: u32) -> Option<u64> {
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, 0, pid) };
+    if !process.is_null() {
+        let running = unsafe { WaitForSingleObject(process, 0) } == WAIT_TIMEOUT;
+        let creation = if running { creation_time(process) } else { None };
+        unsafe { CloseHandle(process) };
+        return creation;
+    }
+    // Права ждать могут и не дать. Тогда — по коду завершения: процесс,
+    // вышедший с кодом 259, сойдёт за живого, но такой код почти никто не
+    // возвращает именно потому, что он значит «ещё работает».
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return None;
+    }
+    let mut code = 0u32;
+    let ok = unsafe { GetExitCodeProcess(process, &mut code) };
+    let running = ok != 0 && code == STILL_ACTIVE as u32;
+    let creation = if running { creation_time(process) } else { None };
+    unsafe { CloseHandle(process) };
+    creation
+}
+
+fn creation_time(process: HANDLE) -> Option<u64> {
     let mut times: [FILETIME; 4] = unsafe { std::mem::zeroed() };
     let [creation, exit, kernel, user] = &mut times;
     let ok = unsafe { GetProcessTimes(process, creation, exit, kernel, user) };
-    unsafe { CloseHandle(process) };
     if ok == 0 {
         return None;
     }
@@ -75,13 +111,31 @@ pub fn created(pid: u32) -> Option<u64> {
 /// Windows отвечает `ERROR_BAD_LENGTH`. Это не ошибка, а «спроси позже», и
 /// отличать её важно — иначе приложение, запущенное лончером, будет
 /// помечено как идущее мимо туннеля.
+///
+/// Тот же ответ бывает и у живого процесса, чей список модулей меняется
+/// прямо во время снимка (кто-то грузит или выгружает DLL). Это проходит за
+/// миллисекунды, поэтому снимок сначала переспрашивается здесь же, коротко,
+/// и только потом наружу уходит `Busy`.
 pub fn has_module(pid: u32, module: &str) -> Result<bool, Busy> {
-    let snapshot =
-        unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) };
-    if snapshot == INVALID_HANDLE_VALUE {
+    const ATTEMPTS: u32 = 4;
+    let mut attempt = 0;
+    let snapshot = loop {
+        let snapshot =
+            unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid) };
+        if snapshot != INVALID_HANDLE_VALUE {
+            break snapshot;
+        }
         let code = unsafe { GetLastError() };
-        return if code == ERROR_BAD_LENGTH { Err(Busy) } else { Ok(false) };
-    }
+        if code != ERROR_BAD_LENGTH {
+            return Ok(false);
+        }
+        attempt += 1;
+        if attempt >= ATTEMPTS {
+            return Err(Busy);
+        }
+        // 1, 2, 4 мс: в сумме меньше десятка, а список успевает устояться.
+        std::thread::sleep(std::time::Duration::from_millis(1 << (attempt - 1)));
+    };
 
     let mut entry: MODULEENTRY32W = unsafe { std::mem::zeroed() };
     entry.dwSize = std::mem::size_of::<MODULEENTRY32W>() as u32;
@@ -230,6 +284,28 @@ mod tests {
         }
         // Несуществующий номер ответа не даёт.
         assert_eq!(created(0xFFFF_FFF0), None);
+    }
+
+    #[test]
+    fn exited_process_is_not_running_while_its_handle_is_held() {
+        let me = std::process::id();
+        assert_eq!(running_since(me), created(me));
+        assert!(running_since(me).is_some());
+
+        // `Child` держит ручку процесса до своего удаления — ровно как
+        // родитель, вызвавший `CreateProcess`. Вышедший ребёнок по ней
+        // ещё открывается и называет время создания, но не работает.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--list")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let _ = child.wait();
+        assert!(created(pid).is_some(), "объект процесса жив, пока открыта ручка");
+        assert_eq!(running_since(pid), None);
+        drop(child);
+        assert_eq!(running_since(0xFFFF_FFF0), None);
     }
 
     #[test]
